@@ -7,7 +7,7 @@ API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv(
     "PHONE_NUMBER"
 )  # Accepts comma-separated numbers, e.g., 2348012345678,2349012345678
-FB_PAGE_NAME = os.getenv("FB_PAGE_NAME", "BBCNews")
+FB_PAGE_NAME = os.getenv("FB_PAGE_NAME", "The Punch")
 
 # Target phrase to filter for the 5:00 AM post
 KEYWORD_TARGET = "Today's Biggest Headlines"
