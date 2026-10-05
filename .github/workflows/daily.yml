@@ -1,0 +1,29 @@
+name: Daily WhatsApp Update
+
+on:
+  schedule:
+    # Runs at 5:30 AM UTC = 6:30 AM WAT (Nigeria Time)
+    - cron: '30 5 * * *'
+  workflow_dispatch: # Allows manual testing button
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Python script
+        env:
+          PHONE_NUMBER: ${{ secrets.PHONE_NUMBER }}
+          CALLMEBOT_API_KEY: ${{ secrets.CALLMEBOT_API_KEY }}
+          FB_PAGE_NAME: ${{ secrets.FB_PAGE_NAME }}
+        run: python main.py
