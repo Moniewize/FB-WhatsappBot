@@ -1,38 +1,81 @@
 import os
+import re
 import xml.etree.ElementTree as ET
 import requests
+from playwright.sync_api import sync_playwright
 
 ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
 
 PUNCH_OFFICIAL_RSS = "https://rss.punchng.com/v1/category/latest_news"
-PUNCH_FB_PAGE_URL = "https://www.facebook.com/punchnewspaper"
 FRONTPAGES_PUNCH_URL = "https://www.frontpages.com/the-punch/"
+PUNCH_FB_PAGE_URL = "https://www.facebook.com/punchnewspaper"
 
 
 def fetch_frontpage_cover_image():
-    """Renders and fetches the full frontpage image from FrontPages using the Microlink headless browser API."""
-    microlink_url = f"https://api.microlink.io/?url={FRONTPAGES_PUNCH_URL}&screenshot=true&embed=screenshot.url"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
-    }
-
+    """Uses Playwright to render JS and extract/download the direct full-resolution image binary."""
+    print(f"🌐 Playwright: Launching headless browser for {FRONTPAGES_PUNCH_URL}...")
     try:
-        print(f"🌐 Headless Render: Requesting cover screenshot via Microlink API...")
-        res = requests.get(microlink_url, headers=headers, timeout=30)
-        print(f"📡 Microlink API Status: {res.status_code}")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                )
+            )
+            page = context.new_page()
 
-        if res.status_code == 200 and len(res.content) > 10000:
-            print(f"✅ Successfully captured frontpage image binary ({len(res.content)} bytes)!")
-            return res.content
-        else:
-            print(f"❌ Microlink failed with status {res.status_code} or small payload size.")
+            # Navigate and wait for DOM network idle so JS fully executes
+            page.goto(FRONTPAGES_PUNCH_URL, wait_until="networkidle", timeout=30000)
+
+            # Strategy 1: Find <a> wrapping the cover image pointing directly to .jpg/.png
+            img_url = None
+            anchors = page.query_selector_all("a[href]")
+            for a in anchors:
+                href = a.get_attribute("href") or ""
+                if re.search(r"\.(jpg|jpeg|png)($|\?)", href, re.I):
+                    if not any(skip in href.lower() for skip in ["logo", "icon", "avatar", "banner"]):
+                        img_url = href
+                        print(f"🖼️ Found full-res image URL in anchor tag: {img_url}")
+                        break
+
+            # Strategy 2: Search dynamically rendered <img> tags
+            if not img_url:
+                imgs = page.query_selector_all("img")
+                for img in imgs:
+                    src = img.get_attribute("src") or img.get_attribute("data-src") or ""
+                    if re.search(r"\.(jpg|jpeg|png)", src, re.I):
+                        if not any(skip in src.lower() for skip in ["logo", "icon", "avatar", "150x150"]):
+                            img_url = src
+                            print(f"🖼️️ Found full-res image URL in <img> element: {img_url}")
+                            break
+
+            browser.close()
+
+            if not img_url:
+                print("❌ Playwright Warning: Could not locate cover image element in rendered DOM!")
+                return None
+
+            # Download the original high-resolution image binary directly
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                )
+            }
+            print(f"🔄 Downloading original full-resolution image from: {img_url}")
+            img_res = requests.get(img_url, headers=headers, timeout=20)
+
+            if img_res.status_code == 200 and len(img_res.content) > 10000:
+                print(f"✅ Downloaded full-resolution cover image ({len(img_res.content)} bytes)!")
+                return img_res.content
+            else:
+                print(f"❌ Image download failed. Status: {img_res.status_code}, Length: {len(img_res.content)} bytes")
+
     except Exception as e:
-        print(f"❌ Error fetching rendered cover image: {e}")
+        print(f"❌ Error during Playwright execution: {e}")
 
     return None
 
@@ -117,7 +160,7 @@ def send_whatsapp_green_api(id_instance, api_token, raw_phones, msg1, msg2, imag
 
         msg_url = f"https://api.green-api.com/waInstance{id_instance}/sendMessage/{api_token}"
 
-        # 1. Deliver Front-Page Image First (if successfully captured)
+        # 1. Deliver Original Full-Resolution Image
         if image_bytes:
             upload_url = f"https://api.green-api.com/waInstance{id_instance}/sendFileByUpload/{api_token}"
             payload = {"chatId": chat_id, "fileName": "punch_frontpage.jpg"}
@@ -125,11 +168,11 @@ def send_whatsapp_green_api(id_instance, api_token, raw_phones, msg1, msg2, imag
             res_img = requests.post(upload_url, data=payload, files=files)
             print(f"Frontpage Cover Image Delivery to ({chat_id}):", res_img.json())
 
-        # 2. Deliver Headlines Digest (Chat 1)
+        # 2. Deliver Headlines Digest
         res1 = requests.post(msg_url, json={"chatId": chat_id, "message": msg1}, headers=headers)
         print(f"Headlines Digest Sent to ({chat_id}):", res1.json())
 
-        # 3. Deliver Facebook Reference Link (Chat 2)
+        # 3. Deliver Facebook Reference Link
         if msg2:
             res2 = requests.post(msg_url, json={"chatId": chat_id, "message": msg2}, headers=headers)
             print(f"Facebook Reference Link Sent to ({chat_id}):", res2.json())
@@ -158,7 +201,7 @@ def main():
         send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, fallback_msg, None, None)
         return
 
-    # Render and fetch cover image binary
+    # Fetch original full-res cover image binary using Playwright
     image_bytes = fetch_frontpage_cover_image()
 
     send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, first_message, second_message, image_bytes)
