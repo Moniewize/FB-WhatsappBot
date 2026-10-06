@@ -2,7 +2,7 @@ name: Daily WhatsApp Update
 
 on:
   schedule:
-    - cron: '30 5 * * *'  # 6:30 AM WAT
+    - cron: '37 5 * * *'  # Runs at 6:37 AM WAT (Off-peak to prevent GitHub schedule queue delays)
   workflow_dispatch:
 
 jobs:
@@ -20,12 +20,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
 
       - name: Run script
         env:
           GREEN_API_ID_INSTANCE: ${{ secrets.GREEN_API_ID_INSTANCE }}
           GREEN_API_TOKEN: ${{ secrets.GREEN_API_TOKEN }}
           PHONE_NUMBER: ${{ secrets.PHONE_NUMBER }}
-          FB_COOKIE: ${{ secrets.FB_COOKIE }}
         run: python main.py
