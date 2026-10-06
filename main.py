@@ -1,22 +1,11 @@
 import os
-import time
 import xml.etree.ElementTree as ET
 import requests
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
+from bs4 import BeautifulSoup
 
 ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
-
-KEYWORDS = [
-    "biggest headlines",
-    "today's biggest headlines",
-    "today’s biggest headlines",
-    "news reports that you shouldn",
-    "headlines",
-]
 
 CUSTOM_FOOTER = (
     "\n\n------------------------------\n"
@@ -25,45 +14,52 @@ CUSTOM_FOOTER = (
 )
 
 PUNCH_OFFICIAL_RSS = "https://rss.punchng.com/v1/category/latest_news"
-PUNCH_FB_PHOTOS_URL = "https://www.facebook.com/punchnewspaper/photos"
 
 
-def get_facebook_first_cover_image_url():
-    """Uses Headless Chrome to render Punch's Facebook page and extract the exact 
+def get_direct_frontpage_cover_url():
+    """Scrapes the exact daily print newspaper front page cover from Punch's website."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        )
+    }
 
-    first photo container image URL."""
-    print("Launching Headless Chrome browser to fetch Facebook cover image...")
-    chrome_options = Options()
-    chrome_options.add_argument("--headless=new")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    )
+    # Direct sections where Punch posts the daily print frontpage image
+    target_urls = [
+        "https://punchng.com/topics/frontpage/",
+        "https://punchng.com/topics/news/",
+        "https://punchng.com/",
+    ]
 
-    driver = webdriver.Chrome(options=chrome_options)
-    img_url = None
+    for page_url in target_urls:
+        try:
+            print(f"Checking for front-page image on: {page_url}")
+            resp = requests.get(page_url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.content, "html.parser")
 
-    try:
-        driver.get(PUNCH_FB_PHOTOS_URL)
-        time.sleep(5)  # Allow dynamic JS content to render
+                # 1. Search for img tags containing frontpage keywords
+                for img in soup.find_all("img"):
+                    src = img.get("src") or img.get("data-src") or ""
+                    alt = img.get("alt") or ""
 
-        # Look for image tags within Facebook post containers
-        images = driver.find_elements(By.TAG_NAME, "img")
-        for img in images:
-            src = img.get_attribute("src") or ""
-            # Filter out UI icons, profile pictures, and small avatars
-            if src and "scontent" in src and "p50x50" not in src and "p160x160" not in src:
-                print(f"Extracted direct Facebook cover image container URL: {src}")
-                img_url = src
-                break
-    except Exception as e:
-        print(f"Error fetching image via Selenium: {e}")
-    finally:
-        driver.quit()
+                    if src and any(k in src.lower() or k in alt.lower() for k in ["frontpage", "front-page", "cover", "newspaper-front"]):
+                        print(f"Successfully located newspaper cover image: {src}")
+                        return src
 
-    return img_url
+                # 2. Fallback: Search meta og:image on the frontpage topic page
+                og_img = soup.find("meta", property="og:image")
+                if og_img and og_img.get("content"):
+                    content_url = og_img["content"]
+                    if "logo" not in content_url.lower():
+                        print(f"Found frontpage topic og:image: {content_url}")
+                        return content_url
+        except Exception as e:
+            print(f"Error checking {page_url}: {e}")
+
+    return None
 
 
 def fetch_and_modify_target_post():
@@ -92,14 +88,13 @@ def fetch_and_modify_target_post():
 
     channel = root.find("channel")
     if channel is None:
-        print("Invalid RSS feed structure.")
         return None, None
 
     items = channel.findall("item")
     print(f"--- Punch RSS: Fetched {len(items)} items ---")
 
-    # Fetch the exact newspaper front page image from Facebook container
-    cover_image_url = get_facebook_first_cover_image_url()
+    # Fetch the daily print newspaper front page cover
+    cover_image_url = get_direct_frontpage_cover_url()
 
     # Format the top 10 headlines text block
     intro_header = (
@@ -125,7 +120,7 @@ def send_whatsapp_green_api(id_instance, api_token, raw_phones, message, cover_i
 
     image_bytes = None
     if cover_image_url:
-        print(f"Downloading raw image binary from Facebook CDN: {cover_image_url}")
+        print(f"Downloading cover image binary from: {cover_image_url}")
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -137,11 +132,13 @@ def send_whatsapp_green_api(id_instance, api_token, raw_phones, message, cover_i
             res = requests.get(cover_image_url, headers=headers, timeout=15)
             if res.status_code == 200:
                 image_bytes = res.content
-                print(f"Successfully downloaded {len(image_bytes)} bytes of the front page cover.")
+                print(f"Successfully downloaded {len(image_bytes)} bytes of image data.")
             else:
                 print(f"Failed to download image. Status code: {res.status_code}")
         except Exception as e:
             print(f"Error downloading image binary: {e}")
+    else:
+        print("No cover image URL could be resolved.")
 
     for recipient in recipient_list:
         clean_recipient = recipient.replace("+", "").replace(" ", "")
@@ -151,25 +148,25 @@ def send_whatsapp_green_api(id_instance, api_token, raw_phones, message, cover_i
         else:
             chat_id = f"{clean_recipient}@c.us"
 
-        # 1. Upload uncompressed raw binary image to WhatsApp
+        # 1. Send front page image via file upload endpoint
         if image_bytes:
             upload_url = f"https://api.green-api.com/waInstance{id_instance}/sendFileByUpload/{api_token}"
             payload = {
                 "chatId": chat_id,
-                "fileName": "newspaper_frontpage.jpg"
+                "fileName": "punch_frontpage.jpg"
             }
             files = {
-                "file": ("newspaper_frontpage.jpg", image_bytes, "image/jpeg")
+                "file": ("punch_frontpage.jpg", image_bytes, "image/jpeg")
             }
             res_img = requests.post(upload_url, data=payload, files=files)
-            print(f"Image delivery response to {chat_id}:", res_img.json())
+            print(f"Image Transmission Status ({chat_id}):", res_img.json())
 
-        # 2. Send headlines text message
+        # 2. Send text message digest
         headers = {"Content-Type": "application/json"}
         msg_url = f"https://api.green-api.com/waInstance{id_instance}/sendMessage/{api_token}"
         payload_msg = {"chatId": chat_id, "message": message}
         res_msg = requests.post(msg_url, json=payload_msg, headers=headers)
-        print(f"Text delivery response to {chat_id}:", res_msg.json())
+        print(f"Text Transmission Status ({chat_id}):", res_msg.json())
 
 
 def main():
