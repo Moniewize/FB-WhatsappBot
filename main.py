@@ -73,12 +73,14 @@ def fetch_and_modify_target_post():
             target_item = item
             break
 
-    # 2. If no single digest post is found, aggregate top 10 latest news stories into 1 digest
+    # 2. Fallback: Aggregate top 10 news stories into exact Punch layout
     if target_item is None and len(items) >= 5:
-        print(
-            "Generating structured headline digest from top news..."
+        print("Generating structured headline digest matching Punch layout...")
+        intro_header = (
+            "Today's Biggest Headlines\n\n"
+            "Here are some of the news reports that you shouldn’t miss this morning:\n"
         )
-        headline_lines = ["📰 *Today's Biggest Headlines*\n"]
+        headline_lines = [intro_header]
         cover_image = None
 
         namespaces = {
@@ -92,9 +94,9 @@ def fetch_and_modify_target_post():
             t_text = t_elem.text.strip() if t_elem is not None else ""
             l_text = l_elem.text.strip() if l_elem is not None else ""
 
-            headline_lines.append(f"{idx}. *{t_text}*\n🔗 {l_text}")
+            headline_lines.append(f"{idx}. {t_text}\n\n=== {l_text}")
 
-            # Grab cover image from the first story item
+            # Grab image from first story
             if idx == 1:
                 media_content = item.find("media:content", namespaces)
                 enclosure = item.find("enclosure")
@@ -113,7 +115,7 @@ def fetch_and_modify_target_post():
         print("Target headline post not found in RSS feed.")
         return None, None
 
-    # Processing matched digest item
+    # Processing matched digest item directly
     title_elem = target_item.find("title")
     desc_elem = target_item.find("description")
     link_elem = target_item.find("link")
@@ -123,8 +125,6 @@ def fetch_and_modify_target_post():
     )
     if not post_text:
         post_text = title_elem.text if title_elem is not None else ""
-
-    link = link_elem.text if link_elem is not None else ""
 
     cover_image = None
     namespaces = {
@@ -142,11 +142,12 @@ def fetch_and_modify_target_post():
 
     paragraphs = [p.strip() for p in post_text.split("\n") if p.strip()]
 
+    # Strip last paragraph (original footer link)
     if len(paragraphs) > 1:
         paragraphs = paragraphs[:-1]
 
     cleaned_body = "\n\n".join(paragraphs)
-    final_message = f"{cleaned_body}\n\n🔗 *Full Post:* {link}{CUSTOM_FOOTER}"
+    final_message = f"{cleaned_body}{CUSTOM_FOOTER}"
 
     return final_message, cover_image
 
@@ -166,23 +167,25 @@ def send_whatsapp_green_api(
 
         headers = {"Content-Type": "application/json"}
 
-        # If an image URL is present, send image card first, then full text body
+        # Step 1: Send Image with short headline title
         if cover_image:
             file_url = f"https://api.green-api.com/waInstance{id_instance}/sendFileByUrl/{api_token}"
             payload_image = {
                 "chatId": chat_id,
                 "urlFile": cover_image,
                 "fileName": "cover_page.jpg",
-                "caption": "📰 *Today's Biggest Headlines*",
+                "caption": "Today's Biggest Headlines",
             }
-            res_img = requests.post(file_url, json=payload_image, headers=headers)
+            res_img = requests.post(
+                file_url, json=payload_image, headers=headers
+            )
             print(f"Image Sent to {chat_id} - Response:", res_img.json())
 
-        # Send full text block (headlines, links, footer) via sendMessage
+        # Step 2: Send complete headlines, links, and custom footer in full text message
         msg_url = f"https://api.green-api.com/waInstance{id_instance}/sendMessage/{api_token}"
         payload_msg = {"chatId": chat_id, "message": message}
         res_msg = requests.post(msg_url, json=payload_msg, headers=headers)
-        print(f"Message Sent to {chat_id} - Response:", res_msg.json())
+        print(f"Full Text Sent to {chat_id} - Response:", res_msg.json())
 
 
 def main():
