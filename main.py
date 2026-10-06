@@ -20,61 +20,36 @@ NITTER_RSS_INSTANCES = [
 ]
 
 
-def fetch_twitter_frontpage_image():
-    """Fetches Punch's latest front-page image via Twitter (Nitter RSS feed)."""
+from duckduckgo_search import DDGS
+
+def fetch_frontpage_image():
+    """Fetches Punch front page image using free DuckDuckGo search (No API key needed)."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
     }
-
-    for rss_url in NITTER_RSS_INSTANCES:
-        try:
-            print(f"🌐 Fetching Twitter RSS feed from: {rss_url}...")
-            res = requests.get(rss_url, headers=headers, timeout=12)
-            print(f"📡 Twitter RSS Status: {res.status_code}")
-
-            if res.status_code != 200:
-                continue
-
-            root = ET.fromstring(res.content)
-            channel = root.find("channel")
-            if channel is None:
-                continue
-
-            items = channel.findall("item")
-            print(f"--- Fetched {len(items)} items from Twitter RSS ---")
-
-            for item in items:
-                title = item.find("title").text if item.find("title") is not None else ""
-                description = item.find("description").text if item.find("description") is not None else ""
-
-                # Check if tweet mentions front page or paper
-                combined_text = (title + " " + description).lower()
-                if any(kw in combined_text for kw in ["front page", "newspaper", "today's paper", "punch front page", "cover"]):
-                    print(f"📌 Found potential Front Page Tweet: {title[:60]}...")
-
-                    # Parse HTML in description tag for high-res media attachment image
-                    soup = BeautifulSoup(description, "html.parser")
-                    img_tag = soup.find("img")
-
-                    if img_tag and img_tag.get("src"):
-                        img_url = img_tag["src"]
-                        print(f"🖼️ Extracted image URL from tweet: {img_url}")
-
-                        # Download direct high-res image binary
-                        img_res = requests.get(img_url, headers=headers, timeout=20)
-                        if img_res.status_code == 200 and len(img_res.content) > 10000:
-                            print(f"✅ Successfully downloaded cover image ({len(img_res.content)} bytes)!")
-                            return img_res.content
-
-        except Exception as e:
-            print(f"⚠️ Error checking instance {rss_url}: {e}")
-
-    print("❌ Scraper Warning: Could not retrieve front-page image from Twitter RSS feeds.")
+    
+    try:
+        print("🌐 Searching DuckDuckGo for Punch front page...")
+        results = list(DDGS().images("Punch newspaper front page today", max_results=5))
+        
+        for item in results:
+            img_url = item.get("image")
+            print(f"📌 Found image candidate: {img_url}")
+            
+            if img_url:
+                img_res = requests.get(img_url, headers=headers, timeout=15)
+                if img_res.status_code == 200 and len(img_res.content) > 10000:
+                    print(f"✅ Downloaded cover image ({len(img_res.content)} bytes)!")
+                    return img_res.content
+                    
+    except Exception as e:
+        print(f"⚠️ DuckDuckGo Search Error: {e}")
+        
+    print("❌ Scraper Warning: Could not retrieve cover image.")
     return None
-
 
 def fetch_and_build_messages():
     headers = {
@@ -198,7 +173,7 @@ def main():
         return
 
     # Fetch original frontpage image from Twitter/Nitter RSS feed
-    image_bytes = fetch_twitter_frontpage_image()
+    image_bytes = fetch_frontpage_image()
 
     send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, first_message, second_message, image_bytes)
 
