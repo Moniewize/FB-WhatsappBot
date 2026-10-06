@@ -12,11 +12,16 @@ PUNCH_FRONTPAGE_URL = "https://punchng.com/topics/frontpage/"
 
 
 def capture_frontpage_with_playwright():
-    """Launches Playwright Chromium to render Punch's page, bypasses strict element selectors,
+    """Renders Punch in Playwright, extracts valid image CDN URLs, and fetches 
 
-    and extracts the top front-page image or element screenshot.
+    the raw image binary directly via requests to prevent element visibility timeouts.
     """
     print("🚀 Launching Headless Chromium with Playwright...")
+    target_urls = [
+        "https://punchng.com",
+        "https://punchng.com/topics/frontpage/",
+    ]
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -30,42 +35,46 @@ def capture_frontpage_with_playwright():
             )
             page = context.new_page()
 
-            print(f"🌐 Navigating to: {PUNCH_FRONTPAGE_URL}")
-            # Wait for DOM content rather than full networkidle to prevent page hang
-            page.goto(PUNCH_FRONTPAGE_URL, wait_until="domcontentloaded", timeout=30000)
+            for url in target_urls:
+                print(f"🌐 Navigating to: {url}")
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                page.evaluate("window.scrollBy(0, 400)")
+                page.wait_for_timeout(2000)
 
-            # Scroll down slightly to trigger lazy-loaded images
-            page.evaluate("window.scrollBy(0, 500)")
-            page.wait_for_timeout(3000)
+                # Collect all img src and data-src attributes
+                images = page.query_selector_all("img")
+                print(f"🔍 Evaluated {len(images)} image tags on page...")
 
-            # Strategy A: Find all img elements on the page and filter out icons/logos
-            images = page.query_selector_all("img")
-            print(f"🔍 Evaluated {len(images)} image tags on page...")
+                for img in images:
+                    src = img.get_attribute("src") or img.get_attribute("data-src") or ""
+                    
+                    # Filter out logos, 404 placeholders, avatars, and tiny icons
+                    if "uploads" in src and not any(
+                        k in src.lower() for k in ["logo", "avatar", "icon", "404", "50x50", "150x150"]
+                    ):
+                        print(f"🖼️ Found candidate cover image URL: {src}")
+                        
+                        # Download binary directly via requests instead of Playwright screenshot()
+                        # This avoids "element is not visible" / scrolling timeouts completely!
+                        try:
+                            res = requests.get(src, timeout=10)
+                            if res.status_code == 200 and len(res.content) > 10000:
+                                print(f"✅ Successfully downloaded {len(res.content)} bytes directly from CDN!")
+                                browser.close()
+                                return res.content, src
+                        except Exception as req_err:
+                            print(f"Failed direct download from {src}: {req_err}")
 
-            for img in images:
-                src = img.get_attribute("src") or img.get_attribute("data-src") or ""
-                # Ignore logos, icons, avatars, and ads
-                if "uploads" in src and not any(k in src.lower() for k in ["logo", "avatar", "icon", "50x50", "150x150"]):
-                    print(f"🖼️ Direct cover image isolated: {src}")
-                    image_bytes = img.screenshot()
-                    browser.close()
-                    if image_bytes and len(image_bytes) > 8000:
-                        return image_bytes, src
-
-            # Strategy B: Fallback - capture a visual screenshot of the top story container
-            main_container = page.query_selector("main") or page.query_selector("#primary")
-            if main_container:
-                print("📸 Capturing visual screenshot of the main front-page container...")
-                image_bytes = main_container.screenshot()
-                browser.close()
-                return image_bytes, PUNCH_FRONTPAGE_URL
-
+            # Fallback: Take a direct screenshot of the full viewport (guaranteed not to time out on element visibility)
+            print("📸 Fallback: Taking viewport screenshot of rendered page...")
+            viewport_bytes = page.screenshot(type="jpeg", quality=80)
             browser.close()
+            return viewport_bytes, "https://punchng.com"
+
     except Exception as e:
         print(f"❌ Playwright capture error: {e}")
 
     return None, None
-
 
 def fetch_and_build_content():
     headers = {
