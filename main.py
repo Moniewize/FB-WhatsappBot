@@ -1,4 +1,5 @@
 import os
+import re
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 import requests
@@ -13,48 +14,72 @@ PUNCH_FB_PAGE_URL = "https://www.facebook.com/punchnewspaper"
 
 
 def fetch_frontpage_cover_image():
-    """Scrapes frontpages.com/the-punch/ to fetch the high-res daily cover photo binary."""
+    """Scrapes frontpages.com/the-punch/ for the daily newspaper cover image URL and downloads the binary."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        )
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
     }
 
     try:
         print(f"🌐 Scraper: Fetching cover page from {FRONTPAGES_PUNCH_URL}...")
         response = requests.get(FRONTPAGES_PUNCH_URL, headers=headers, timeout=15)
+        print(f"📡 FrontPages HTTP Status: {response.status_code}")
+
         if response.status_code != 200:
-            print(f"Failed to fetch FrontPages. Status code: {response.status_code}")
+            print(f"❌ Failed to reach FrontPages. Status code: {response.status_code}")
             return None
 
         soup = BeautifulSoup(response.content, "html.parser")
+        target_img_url = None
 
-        # Search for main cover image elements on FrontPages
-        img_tag = soup.find("img", class_="attachment-full") or soup.find("img", class_="size-full")
-
-        if not img_tag:
-            # Fallback: search for any image inside the main post container
-            main_container = soup.find("article") or soup.find("main")
-            if main_container:
-                img_tag = main_container.find("img")
-
-        if not img_tag:
-            # General search across all img tags on page for frontpage image URLs
-            for img in soup.find_all("img"):
-                src = img.get("src") or img.get("data-src") or ""
-                if "frontpages" in src or "uploads" in src:
-                    img_tag = img
+        # Method 1: Look for <a> links wrapping the cover image that point to .jpg/.png files
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag["href"]
+            if re.search(r"\.(jpg|jpeg|png)($|\?)", href, re.IGNORECASE):
+                # Filter out small UI icons/logos
+                if not any(skip in href.lower() for skip in ["logo", "icon", "avatar", "banner"]):
+                    target_img_url = href
+                    print(f"🖼️ Found cover image link in <a> tag: {target_img_url}")
                     break
 
-        if img_tag:
-            img_url = img_tag.get("src") or img_tag.get("data-src")
-            if img_url:
-                print(f"🖼️ Found FrontPages cover image URL: {img_url}")
-                img_res = requests.get(img_url, headers=headers, timeout=15)
-                if img_res.status_code == 200 and len(img_res.content) > 5000:
-                    print(f"✅ Successfully downloaded {len(img_res.content)} bytes from FrontPages!")
-                    return img_res.content
+        # Method 2: If no <a> link found, inspect all <img> tags for src, srcset, or data-src
+        if not target_img_url:
+            for img in soup.find_all("img"):
+                # Check src, data-src, or first URL in srcset
+                src = img.get("src") or img.get("data-src") or ""
+                srcset = img.get("srcset") or ""
+
+                candidates = [src]
+                if srcset:
+                    # extract URLs from srcset attribute (e.g. "image.jpg 1024w, image-small.jpg 300w")
+                    candidates.extend([item.strip().split()[0] for item in srcset.split(",") if item.strip()])
+
+                for url in candidates:
+                    if url and re.search(r"\.(jpg|jpeg|png)", url, re.IGNORECASE):
+                        if not any(skip in url.lower() for skip in ["logo", "icon", "avatar", "150x150"]):
+                            target_img_url = url
+                            print(f"🖼️ Found cover image in <img> tag: {target_img_url}")
+                            break
+                if target_img_url:
+                    break
+
+        if not target_img_url:
+            print("❌ Scraper Warning: Could not locate cover image element on FrontPages!")
+            return None
+
+        # Download the cover image binary
+        print(f"🔄 Downloading image binary from: {target_img_url}")
+        img_res = requests.get(target_img_url, headers=headers, timeout=20)
+        
+        if img_res.status_code == 200 and len(img_res.content) > 5000:
+            print(f"✅ Successfully downloaded {len(img_res.content)} bytes of frontpage cover image!")
+            return img_res.content
+        else:
+            print(f"❌ Image download failed. Status: {img_res.status_code}, Length: {len(img_res.content)} bytes")
 
     except Exception as e:
         print(f"❌ Error scraping FrontPages cover image: {e}")
@@ -66,7 +91,7 @@ def fetch_and_build_messages():
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
     }
 
