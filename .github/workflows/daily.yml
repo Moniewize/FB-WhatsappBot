@@ -27,4 +27,5 @@ jobs:
           GREEN_API_ID_INSTANCE: ${{ secrets.GREEN_API_ID_INSTANCE }}
           GREEN_API_TOKEN: ${{ secrets.GREEN_API_TOKEN }}
           PHONE_NUMBER: ${{ secrets.PHONE_NUMBER }}
+          FB_COOKIE: ${{ secrets.FB_COOKIE }}
         run: python main.py
