@@ -1,2 +1,3 @@
-requests
+vrequests
 beautifulsoup4
+playwright

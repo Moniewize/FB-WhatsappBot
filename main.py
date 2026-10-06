@@ -1,8 +1,8 @@
 import os
 import re
 import xml.etree.ElementTree as ET
-from bs4 import BeautifulSoup
 import requests
+from playwright.sync_api import sync_playwright
 
 ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
@@ -14,93 +14,75 @@ PUNCH_FB_PAGE_URL = "https://www.facebook.com/punchnewspaper"
 
 
 def fetch_frontpage_cover_image():
-    """Scrapes frontpages.com for the direct original high-res cover image binary using full browser headers."""
-    # Complete browser headers to bypass FrontPages anti-bot/empty template checks
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "max-age=0",
-        "Sec-Ch-Ua": '"Not-A.Brand";v="99", "Chromium";v="124", "Google Chrome";v="124"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-    }
-
+    """Renders JS via Playwright to extract and download the direct high-res image binary."""
+    print(f"🌐 Playwright: Launching headless browser for {FRONTPAGES_PUNCH_URL}...")
     try:
-        print(f"🌐 Scraper: Requesting cover page from {FRONTPAGES_PUNCH_URL}...")
-        session = requests.Session()
-        response = session.get(FRONTPAGES_PUNCH_URL, headers=headers, timeout=20)
-        print(f"📡 FrontPages HTTP Status: {response.status_code}")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                )
+            )
+            page = context.new_page()
 
-        if response.status_code != 200:
-            print(f"❌ Failed to fetch page. Status: {response.status_code}")
-            return None
+            # Wait until DOM and network requests settle
+            page.goto(FRONTPAGES_PUNCH_URL, wait_until="networkidle", timeout=30000)
 
-        soup = BeautifulSoup(response.content, "html.parser")
-        target_img_url = None
+            img_url = None
 
-        # Method 1: Look for <a> links linking directly to full-res image files (.jpg/.png)
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if re.search(r"\.(jpg|jpeg|png)($|\?)", href, re.IGNORECASE):
-                if not any(skip in href.lower() for skip in ["logo", "icon", "avatar", "banner", "150x150"]):
-                    target_img_url = href
-                    print(f"🖼️ Found direct cover link in <a> tag: {target_img_url}")
-                    break
+            # Strategy 1: Look for <a> tags linking directly to high-res image files
+            anchors = page.query_selector_all("a[href]")
+            for a in anchors:
+                href = a.get_attribute("href") or ""
+                if re.search(r"\.(jpg|jpeg|png)($|\?)", href, re.I):
+                    if not any(skip in href.lower() for skip in ["logo", "icon", "avatar", "banner", "150x150"]):
+                        img_url = href
+                        print(f"🖼️ Found full-res image URL in anchor tag: {img_url}")
+                        break
 
-        # Method 2: Inspect all <img> elements and data attributes
-        if not target_img_url:
-            for img in soup.find_all("img"):
-                src = img.get("src") or img.get("data-src") or img.get("data-lazy-src") or ""
-                srcset = img.get("srcset") or ""
-
-                candidates = [src]
-                if srcset:
-                    candidates.extend([item.strip().split()[0] for item in srcset.split(",") if item.strip()])
-
-                for url in candidates:
-                    if url and re.search(r"\.(jpg|jpeg|png)", url, re.IGNORECASE):
-                        if not any(skip in url.lower() for skip in ["logo", "icon", "avatar", "150x150"]):
-                            target_img_url = url
-                            print(f"🖼️ Found cover URL in <img> element: {target_img_url}")
+            # Strategy 2: Check dynamically rendered <img> tags
+            if not img_url:
+                imgs = page.query_selector_all("img")
+                for img in imgs:
+                    src = img.get_attribute("src") or img.get_attribute("data-src") or ""
+                    if re.search(r"\.(jpg|jpeg|png)", src, re.I):
+                        if not any(skip in src.lower() for skip in ["logo", "icon", "avatar", "150x150"]):
+                            img_url = src
+                            print(f"🖼️ Found full-res image URL in <img> element: {img_url}")
                             break
-                if target_img_url:
-                    break
 
-        if not target_img_url:
-            print("❌ Scraper Warning: No cover image element found in returned HTML DOM!")
-            return None
+            browser.close()
 
-        # Handle relative URLs
-        if target_img_url.startswith("//"):
-            target_img_url = "https:" + target_img_url
-        elif target_img_url.startswith("/"):
-            target_img_url = "https://www.frontpages.com" + target_img_url
+            if not img_url:
+                print("❌ Playwright Warning: No cover image element detected in rendered DOM.")
+                return None
 
-        # Download direct original high-resolution image binary
-        print(f"🔄 Downloading original full-resolution image from: {target_img_url}")
-        img_headers = headers.copy()
-        img_headers["Referer"] = FRONTPAGES_PUNCH_URL
-        img_headers["Accept"] = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+            # Ensure complete URL schema
+            if img_url.startswith("//"):
+                img_url = "https:" + img_url
+            elif img_url.startswith("/"):
+                img_url = "https://www.frontpages.com" + img_url
 
-        img_res = session.get(target_img_url, headers=img_headers, timeout=20)
+            # Download original high-resolution image binary directly
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                )
+            }
+            print(f"🔄 Downloading original full-resolution image from: {img_url}")
+            img_res = requests.get(img_url, headers=headers, timeout=20)
 
-        if img_res.status_code == 200 and len(img_res.content) > 10000:
-            print(f"✅ Successfully downloaded original image binary ({len(img_res.content)} bytes)!")
-            return img_res.content
-        else:
-            print(f"❌ Image download failed. Status: {img_res.status_code}, Length: {len(img_res.content)} bytes")
+            if img_res.status_code == 200 and len(img_res.content) > 10000:
+                print(f"✅ Downloaded full-resolution cover image ({len(img_res.content)} bytes)!")
+                return img_res.content
+            else:
+                print(f"❌ Image download failed. Status: {img_res.status_code}, Length: {len(img_res.content)} bytes")
 
     except Exception as e:
-        print(f"❌ Error scraping cover image: {e}")
+        print(f"❌ Error during Playwright execution: {e}")
 
     return None
 
@@ -185,7 +167,7 @@ def send_whatsapp_green_api(id_instance, api_token, raw_phones, msg1, msg2, imag
 
         msg_url = f"https://api.green-api.com/waInstance{id_instance}/sendMessage/{api_token}"
 
-        # 1. Deliver Original Full-Resolution Image First
+        # 1. Deliver Original Full-Resolution Image
         if image_bytes:
             upload_url = f"https://api.green-api.com/waInstance{id_instance}/sendFileByUpload/{api_token}"
             payload = {"chatId": chat_id, "fileName": "punch_frontpage.jpg"}
@@ -226,7 +208,6 @@ def main():
         send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, fallback_msg, None, None)
         return
 
-    # Fetch original full-resolution cover image binary
     image_bytes = fetch_frontpage_cover_image()
 
     send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, first_message, second_message, image_bytes)
