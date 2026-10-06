@@ -1,7 +1,7 @@
 import os
-import urllib.parse
 import xml.etree.ElementTree as ET
 import requests
+from bs4 import BeautifulSoup
 
 ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
@@ -16,12 +16,38 @@ KEYWORDS = [
 ]
 
 CUSTOM_FOOTER = (
-    "\n\n------------------------------\n"
-    "✨ *Customized Daily Briefing*\n"
-    "Have a productive and great day ahead!"
+    
+    "Source: The Punch"
+    "Brought by: RAC-FUTO Editorial Team"
 )
 
 PUNCH_OFFICIAL_RSS = "https://rss.punchng.com/v1/category/latest_news"
+
+
+def extract_high_res_og_image(article_url):
+    """Scrapes the article page directly to find the full-resolution meta og:image."""
+    if not article_url:
+        return None
+    
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/115.0.0.0 Safari/537.36"
+        )
+    }
+    
+    try:
+        resp = requests.get(article_url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.content, "html.parser")
+            og_img = soup.find("meta", property="og:image")
+            if og_img and og_img.get("content"):
+                return og_img["content"]
+    except Exception as e:
+        print(f"Failed to scrape og:image from {article_url}: {e}")
+        
+    return None
 
 
 def fetch_and_modify_target_post():
@@ -70,11 +96,6 @@ def fetch_and_modify_target_post():
             target_item = item
             break
 
-    namespaces = {
-        "media": "http://search.yahoo.com/mrss/",
-        "content": "http://purl.org/rss/1.0/modules/content/",
-    }
-
     # Aggregate top 10 headlines into exact Punch layout
     if target_item is None and len(items) >= 5:
         print("Generating structured headline digest matching Punch layout...")
@@ -83,7 +104,9 @@ def fetch_and_modify_target_post():
             "Here are some of the news reports that you shouldn’t miss this morning:\n"
         )
         headline_lines = [intro_header]
-        cover_image = None
+        cover_image_url = None
+
+        first_article_link = ""
 
         for idx, item in enumerate(items[:10], 1):
             t_elem = item.find("title")
@@ -91,19 +114,17 @@ def fetch_and_modify_target_post():
             t_text = t_elem.text.strip() if t_elem is not None else ""
             l_text = l_elem.text.strip() if l_elem is not None else ""
 
+            if idx == 1:
+                first_article_link = l_text
+
             headline_lines.append(f"{idx}. {t_text}\n\n=== {l_text}")
 
-            # Grab high-resolution image URL from the lead article
-            if idx == 1:
-                media_content = item.find("media:content", namespaces)
-                enclosure = item.find("enclosure")
-                if media_content is not None and media_content.attrib.get("url"):
-                    cover_image = media_content.attrib.get("url")
-                elif enclosure is not None and enclosure.attrib.get("url"):
-                    cover_image = enclosure.attrib.get("url")
+        # Fetch actual front-page/lead article cover photo via og:image scraping
+        if first_article_link:
+            cover_image_url = extract_high_res_og_image(first_article_link)
 
         final_message = "\n\n".join(headline_lines) + CUSTOM_FOOTER
-        return final_message, cover_image
+        return final_message, cover_image_url
 
     if target_item is None:
         print("Target headline post not found in RSS feed.")
@@ -112,19 +133,14 @@ def fetch_and_modify_target_post():
     # Processing matched post
     title_elem = target_item.find("title")
     desc_elem = target_item.find("description")
+    link_elem = target_item.find("link")
 
     post_text = desc_elem.text if desc_elem is not None and desc_elem.text else ""
     if not post_text:
         post_text = title_elem.text if title_elem is not None else ""
 
-    cover_image = None
-    media_content = target_item.find("media:content", namespaces)
-    enclosure = target_item.find("enclosure")
-
-    if media_content is not None and media_content.attrib.get("url"):
-        cover_image = media_content.attrib.get("url")
-    elif enclosure is not None and enclosure.attrib.get("url"):
-        cover_image = enclosure.attrib.get("url")
+    link_text = link_elem.text if link_elem is not None else ""
+    cover_image_url = extract_high_res_og_image(link_text)
 
     paragraphs = [p.strip() for p in post_text.split("\n") if p.strip()]
 
@@ -134,11 +150,24 @@ def fetch_and_modify_target_post():
     cleaned_body = "\n\n".join(paragraphs)
     final_message = f"{cleaned_body}{CUSTOM_FOOTER}"
 
-    return final_message, cover_image
+    return final_message, cover_image_url
 
 
-def send_whatsapp_green_api(id_instance, api_token, raw_phones, message, cover_image=None):
+def send_whatsapp_green_api(id_instance, api_token, raw_phones, message, cover_image_url=None):
     recipient_list = [p.strip() for p in raw_phones.split(",") if p.strip()]
+
+    # Download raw image bytes directly to memory if image URL exists
+    image_bytes = None
+    if cover_image_url:
+        print(f"Downloading cover image directly from: {cover_image_url}")
+        try:
+            res = requests.get(cover_image_url, timeout=15)
+            if res.status_code == 200:
+                image_bytes = res.content
+            else:
+                print(f"Failed to download image. Status: {res.status_code}")
+        except Exception as e:
+            print(f"Error downloading cover image: {e}")
 
     for recipient in recipient_list:
         clean_recipient = recipient.replace("+", "").replace(" ", "")
@@ -148,20 +177,21 @@ def send_whatsapp_green_api(id_instance, api_token, raw_phones, message, cover_i
         else:
             chat_id = f"{clean_recipient}@c.us"
 
-        headers = {"Content-Type": "application/json"}
-
-        # Step 1: Send high-res cover image as standalone media
-        if cover_image:
-            file_url = f"https://api.green-api.com/waInstance{id_instance}/sendFileByUrl/{api_token}"
-            payload_image = {
+        # Step 1: Upload and send raw original image binary without modifying bits
+        if image_bytes:
+            upload_url = f"https://api.green-api.com/waInstance{id_instance}/sendFileByUpload/{api_token}"
+            payload = {
                 "chatId": chat_id,
-                "urlFile": cover_image,
-                "fileName": "front_page.jpg",
+                "fileName": "punch_front_page.jpg"
             }
-            res_img = requests.post(file_url, json=payload_image, headers=headers)
-            print(f"High-Res Image Sent to {chat_id} - Response:", res_img.json())
+            files = {
+                "file": ("punch_front_page.jpg", image_bytes, "image/jpeg")
+            }
+            res_img = requests.post(upload_url, data=payload, files=files)
+            print(f"Direct Binary Image Sent to {chat_id} - Response:", res_img.json())
 
-        # Step 2: Send full 10-headline text block + links + custom footer
+        # Step 2: Send complete text block + links + custom footer
+        headers = {"Content-Type": "application/json"}
         msg_url = f"https://api.green-api.com/waInstance{id_instance}/sendMessage/{api_token}"
         payload_msg = {"chatId": chat_id, "message": message}
         res_msg = requests.post(msg_url, json=payload_msg, headers=headers)
@@ -181,7 +211,7 @@ def main():
         print(f"Error: Missing required environment variables: {', '.join(missing)}")
         return
 
-    message, cover_image = fetch_and_modify_target_post()
+    message, cover_image_url = fetch_and_modify_target_post()
 
     if not message:
         fallback_msg = (
@@ -191,7 +221,7 @@ def main():
         send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, fallback_msg)
         return
 
-    send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, message, cover_image)
+    send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, message, cover_image_url)
 
 
 if __name__ == "__main__":
