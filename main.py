@@ -81,8 +81,18 @@ def send_whatsapp_green_api(id_instance, api_token, raw_phones, message):
 
 
 def main():
-    if not ID_INSTANCE or not API_TOKEN or not PHONE_NUMBERS:
-        print("Error: Missing required environment variables.")
+    missing = []
+    if not ID_INSTANCE:
+        missing.append("GREEN_API_ID_INSTANCE")
+    if not API_TOKEN:
+        missing.append("GREEN_API_TOKEN")
+    if not PHONE_NUMBERS:
+        missing.append("PHONE_NUMBER")
+
+    if missing:
+        print(
+            f"Error: Missing required environment variables: {', '.join(missing)}"
+        )
         return
 
     message = fetch_and_modify_target_post(FB_PAGE_NAME)
