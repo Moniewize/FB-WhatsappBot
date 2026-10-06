@@ -1,5 +1,6 @@
 import os
 import urllib.parse
+import xml.etree.ElementTree as ET
 import requests
 
 ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
@@ -7,55 +8,116 @@ API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
 FB_PAGE_NAME = os.getenv("FB_PAGE_NAME", "punchnewspaper")
 
-KEYWORDS = ["biggest headlines", "news reports that you shouldn"]
+KEYWORDS = [
+    "biggest headlines",
+    "today's biggest headlines",
+    "today’s biggest headlines",
+    "news reports that you shouldn",
+    "headlines",
+]
 
 CUSTOM_FOOTER = (
     "\n\n------------------------------\n"
-    "Source: The Punch"
-    "Brought by: RAC-FUTO Editorial Team"
+    "✨ *Customized Daily Briefing*\n"
+    "Have a productive and great day ahead!"
 )
 
 
 def fetch_and_modify_target_post(page_name):
+    # Fetch RSS XML directly from rss.app without third-party converters
     rss_url = f"https://rss.app/feeds/v1/facebook/{page_name}.xml"
-    api_url = (
-        f"https://api.rss2json.com/v1/api.json?rss_url={urllib.parse.quote(rss_url)}"
-    )
 
-    response = requests.get(api_url)
-    if response.status_code != 200:
-        print("Failed to fetch RSS data from API.")
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/115.0.0.0 Safari/537.36"
+        )
+    }
+
+    try:
+        response = requests.get(rss_url, headers=headers, timeout=15)
+        if response.status_code != 200:
+            print(
+                f"Failed to fetch direct RSS XML. Status code: {response.status_code}"
+            )
+            return None, None
+    except Exception as e:
+        print(f"Exception while fetching RSS feed: {e}")
         return None, None
 
-    data = response.json()
-    items = data.get("items", [])
+    try:
+        root = ET.fromstring(response.content)
+    except Exception as e:
+        print(f"Failed to parse XML content: {e}")
+        return None, None
+
+    # Standard RSS items are inside <channel><item>...
+    channel = root.find("channel")
+    if channel is None:
+        print("Invalid RSS feed structure (no channel element found).")
+        return None, None
+
+    items = channel.findall("item")
+    print(f"--- Direct XML Debug: Fetched {len(items)} items ---")
 
     target_item = None
     for item in items:
-        content = (item.get("description", "") or item.get("title", "")).lower()
-        if any(keyword in content for keyword in KEYWORDS):
+        title_elem = item.find("title")
+        desc_elem = item.find("description")
+
+        title = title_elem.text if title_elem is not None else ""
+        desc = desc_elem.text if desc_elem is not None else ""
+
+        full_content = (desc or title).lower()
+
+        if any(keyword in full_content for keyword in KEYWORDS):
             target_item = item
             break
 
-    if not target_item:
-        print("Target headline post not published yet or not found.")
+    if target_item is None:
+        print("Target headline post not matched in current direct XML feed.")
         return None, None
 
-    post_text = target_item.get("description", target_item.get("title", ""))
-    link = target_item.get("link", "")
+    # Extract text & link
+    title_elem = target_item.find("title")
+    desc_elem = target_item.find("description")
+    link_elem = target_item.find("link")
 
-    # Grab strictly the first/cover image URL
-    cover_image = target_item.get("thumbnail") or target_item.get(
-        "enclosure", {}
-    ).get("link")
+    post_text = (
+        desc_elem.text if desc_elem is not None and desc_elem.text else ""
+    )
+    if not post_text:
+        post_text = title_elem.text if title_elem is not None else ""
 
+    link = link_elem.text if link_elem is not None else ""
+
+    # Extract cover image from media:content or enclosure tags
+    cover_image = None
+    # Check media:content / media:thumbnail
+    namespaces = {
+        "media": "http://search.yahoo.com/mrss/",
+        "content": "http://purl.org/rss/1.0/modules/content/",
+    }
+
+    media_content = target_item.find("media:content", namespaces)
+    media_thumbnail = target_item.find("media:thumbnail", namespaces)
+    enclosure = target_item.find("enclosure")
+
+    if media_content is not None and media_content.attrib.get("url"):
+        cover_image = media_content.attrib.get("url")
+    elif media_thumbnail is not None and media_thumbnail.attrib.get("url"):
+        cover_image = media_thumbnail.attrib.get("url")
+    elif enclosure is not None and enclosure.attrib.get("url"):
+        cover_image = enclosure.attrib.get("url")
+
+    # Format body paragraphs
     paragraphs = [p.strip() for p in post_text.split("\n") if p.strip()]
 
-    # Strip the original last paragraph (footer & footer link)
+    # Strip the original bottom paragraph (footer link)
     if len(paragraphs) > 1:
         paragraphs = paragraphs[:-1]
 
-    # Reconstruct text: 10 headlines with preserved article links + custom footer
     cleaned_body = "\n\n".join(paragraphs)
     final_message = f"{cleaned_body}\n\n🔗 *Full Post:* {link}{CUSTOM_FOOTER}"
 
@@ -65,15 +127,19 @@ def fetch_and_modify_target_post(page_name):
 def send_whatsapp_green_api(
     id_instance, api_token, raw_phones, message, cover_image=None
 ):
-    phone_list = [p.strip() for p in raw_phones.split(",") if p.strip()]
+    recipient_list = [p.strip() for p in raw_phones.split(",") if p.strip()]
 
-    for phone in phone_list:
-        clean_phone = phone.replace("+", "").replace(" ", "")
-        chat_id = f"{clean_phone}@c.us"
+    for recipient in recipient_list:
+        clean_recipient = recipient.replace("+", "").replace(" ", "")
+
+        if "@g.us" in clean_recipient or "@c.us" in clean_recipient:
+            chat_id = clean_recipient
+        else:
+            chat_id = f"{clean_recipient}@c.us"
+
         headers = {"Content-Type": "application/json"}
 
         if cover_image:
-            # Send cover image as a single WhatsApp media card with full caption
             url = f"https://api.green-api.com/waInstance{id_instance}/sendFileByUrl/{api_token}"
             payload = {
                 "chatId": chat_id,
@@ -82,12 +148,11 @@ def send_whatsapp_green_api(
                 "caption": message,
             }
         else:
-            # Fallback text message if no image thumbnail is returned
             url = f"https://api.green-api.com/waInstance{id_instance}/sendMessage/{api_token}"
             payload = {"chatId": chat_id, "message": message}
 
         response = requests.post(url, json=payload, headers=headers)
-        print(f"Sent to {clean_phone} - Response:", response.json())
+        print(f"Sent to {chat_id} - Response:", response.json())
 
 
 def main():
