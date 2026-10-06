@@ -5,14 +5,14 @@ import requests
 ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
-FB_PAGE_NAME = os.getenv("FB_PAGE_NAME", "punchnewspaper")
+FB_PAGE_NAME = os.getenv("FB_PAGE_NAME", "The Punch")
 
 KEYWORDS = ["biggest headlines", "news reports that you shouldn"]
 
 CUSTOM_FOOTER = (
     "\n\n------------------------------\n"
-    "✨ *Customized Daily Briefing*\n"
-    "Have a productive and great day ahead!"
+    "Source: The Punch"
+    "Brought by: RAC-FUTO Editorial Team"
 )
 
 
