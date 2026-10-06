@@ -17,8 +17,8 @@ KEYWORDS = [
 
 CUSTOM_FOOTER = (
     "\n\n------------------------------\n"
-    "Source: The Punch \n"
-    "Brought by: RAC-FUTO Editorial team"
+    "✨ *Customized Daily Briefing*\n"
+    "Have a productive and great day ahead!"
 )
 
 PUNCH_OFFICIAL_RSS = "https://rss.punchng.com/v1/category/latest_news"
@@ -76,7 +76,7 @@ def fetch_and_modify_target_post():
     # 2. If no single digest post is found, aggregate top 10 latest news stories into 1 digest
     if target_item is None and len(items) >= 5:
         print(
-            "No single Facebook digest post found in feed. Generating structured headline digest from top news..."
+            "Generating structured headline digest from top news..."
         )
         headline_lines = ["📰 *Today's Biggest Headlines*\n"]
         cover_image = None
@@ -166,20 +166,23 @@ def send_whatsapp_green_api(
 
         headers = {"Content-Type": "application/json"}
 
+        # If an image URL is present, send image card first, then full text body
         if cover_image:
-            url = f"https://api.green-api.com/waInstance{id_instance}/sendFileByUrl/{api_token}"
-            payload = {
+            file_url = f"https://api.green-api.com/waInstance{id_instance}/sendFileByUrl/{api_token}"
+            payload_image = {
                 "chatId": chat_id,
                 "urlFile": cover_image,
                 "fileName": "cover_page.jpg",
-                "caption": message,
+                "caption": "📰 *Today's Biggest Headlines*",
             }
-        else:
-            url = f"https://api.green-api.com/waInstance{id_instance}/sendMessage/{api_token}"
-            payload = {"chatId": chat_id, "message": message}
+            res_img = requests.post(file_url, json=payload_image, headers=headers)
+            print(f"Image Sent to {chat_id} - Response:", res_img.json())
 
-        response = requests.post(url, json=payload, headers=headers)
-        print(f"Sent to {chat_id} - Response:", response.json())
+        # Send full text block (headlines, links, footer) via sendMessage
+        msg_url = f"https://api.green-api.com/waInstance{id_instance}/sendMessage/{api_token}"
+        payload_msg = {"chatId": chat_id, "message": message}
+        res_msg = requests.post(msg_url, json=payload_msg, headers=headers)
+        print(f"Message Sent to {chat_id} - Response:", res_msg.json())
 
 
 def main():
