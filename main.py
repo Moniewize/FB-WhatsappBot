@@ -1,18 +1,20 @@
 import os
+import re
 import xml.etree.ElementTree as ET
+from bs4 import BeautifulSoup
 import requests
-from duckduckgo_search import DDGS
 
 ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
 
 PUNCH_OFFICIAL_RSS = "https://rss.punchng.com/v1/category/latest_news"
+PUNCH_EPAPER_URL = "https://epaper.punchng.com/"
 PUNCH_FB_PAGE_URL = "https://www.facebook.com/punchnewspaper"
 
 
-def fetch_frontpage_image():
-    """Fetches Punch front page image using DuckDuckGo search."""
+def fetch_epaper_frontpage_image():
+    """Extracts the direct front-page cover image binary from Punch e-Paper portal using standard HTTP requests."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -21,27 +23,49 @@ def fetch_frontpage_image():
     }
 
     try:
-        print("🌐 Searching DuckDuckGo for Punch front page...")
-        with DDGS() as ddgs:
-            results = list(ddgs.images("Punch newspaper front page today", max_results=5))
+        print(f"🌐 Requesting Punch e-Paper portal: {PUNCH_EPAPER_URL}...")
+        res = requests.get(PUNCH_EPAPER_URL, headers=headers, timeout=15)
+        print(f"📡 e-Paper HTTP Status: {res.status_code}")
 
-        for item in results:
-            img_url = item.get("image")
-            print(f"📌 Found image candidate: {img_url}")
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.content, "html.parser")
+            img_url = None
+
+            # Look for front-page image elements in e-paper landing page
+            for img in soup.find_all("img"):
+                src = img.get("src") or img.get("data-src") or ""
+                if any(kw in src.lower() for kw in ["cover", "frontpage", "edition", "paper", "thumb"]):
+                    img_url = src
+                    print(f"🖼️ Found potential cover image element: {img_url}")
+                    break
+
+            # Fallback: grab the first substantial image asset on the e-paper portal
+            if not img_url:
+                for img in soup.find_all("img"):
+                    src = img.get("src") or img.get("data-src") or ""
+                    if re.search(r"\.(jpg|jpeg|png)", src, re.I):
+                        if not any(skip in src.lower() for skip in ["logo", "icon", "banner", "avatar"]):
+                            img_url = src
+                            print(f"🖼️ Fallback image candidate found: {img_url}")
+                            break
 
             if img_url:
-                try:
-                    img_res = requests.get(img_url, headers=headers, timeout=15)
-                    if img_res.status_code == 200 and len(img_res.content) > 10000:
-                        print(f"✅ Downloaded cover image ({len(img_res.content)} bytes)!")
-                        return img_res.content
-                except Exception as e:
-                    print(f"⚠️ Error downloading candidate {img_url}: {e}")
+                # Ensure absolute URL schema
+                if img_url.startswith("//"):
+                    img_url = "https:" + img_url
+                elif img_url.startswith("/"):
+                    img_url = "https://epaper.punchng.com" + img_url
+
+                print(f"🔄 Downloading cover image binary from: {img_url}")
+                img_res = requests.get(img_url, headers=headers, timeout=20)
+                if img_res.status_code == 200 and len(img_res.content) > 10000:
+                    print(f"✅ Downloaded cover image ({len(img_res.content)} bytes)!")
+                    return img_res.content
 
     except Exception as e:
-        print(f"⚠️ DuckDuckGo Search Error: {e}")
+        print(f"⚠️ Error fetching e-paper cover image: {e}")
 
-    print("❌ Scraper Warning: Could not retrieve cover image.")
+    print("❌ Scraper Warning: Could not retrieve e-paper cover image.")
     return None
 
 
@@ -123,6 +147,7 @@ def send_whatsapp_green_api(id_instance, api_token, raw_phones, msg1, msg2, imag
 
         msg_url = f"https://api.green-api.com/waInstance{id_instance}/sendMessage/{api_token}"
 
+        # 1. Deliver Cover Image if found
         if image_bytes:
             upload_url = f"https://api.green-api.com/waInstance{id_instance}/sendFileByUpload/{api_token}"
             payload = {"chatId": chat_id, "fileName": "punch_frontpage.jpg"}
@@ -133,9 +158,11 @@ def send_whatsapp_green_api(id_instance, api_token, raw_phones, msg1, msg2, imag
             except Exception as e:
                 print(f"Failed to send image: {e}")
 
+        # 2. Deliver Headlines Digest
         res1 = requests.post(msg_url, json={"chatId": chat_id, "message": msg1}, headers=headers, timeout=15)
         print(f"Headlines Digest Sent to ({chat_id}):", res1.json())
 
+        # 3. Deliver Reference Link
         if msg2:
             res2 = requests.post(msg_url, json={"chatId": chat_id, "message": msg2}, headers=headers, timeout=15)
             print(f"Facebook Reference Link Sent to ({chat_id}):", res2.json())
@@ -164,7 +191,7 @@ def main():
         send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, fallback_msg, None, None)
         return
 
-    image_bytes = fetch_frontpage_image()
+    image_bytes = fetch_epaper_frontpage_image()
     send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, first_message, second_message, image_bytes)
 
 
