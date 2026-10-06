@@ -2,7 +2,7 @@ name: Daily WhatsApp Update
 
 on:
   schedule:
-    - cron: '37 5 * * *'  # 6:37 AM WAT
+    - cron: '37 5 * * *'  # 6:37 AM WAT (Off-peak schedule)
   workflow_dispatch:
 
 jobs:
