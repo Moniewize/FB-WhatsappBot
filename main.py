@@ -11,8 +11,8 @@ KEYWORDS = ["biggest headlines", "news reports that you shouldn"]
 
 CUSTOM_FOOTER = (
     "\n\n------------------------------\n"
-    "✨ *Customized Daily Briefing*\n"
-    "Have a productive and great day ahead!"
+    "Source: The Punch"
+    "Brought by: RAC-FUTO Editorial Team"
 )
 
 
