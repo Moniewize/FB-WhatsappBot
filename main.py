@@ -7,13 +7,12 @@ API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
 FB_PAGE_NAME = os.getenv("FB_PAGE_NAME", "punchnewspaper")
 
-# Broad keywords so variations like "Today's", "Today’s", or minor phrasing won't cause misses
 KEYWORDS = ["biggest headlines", "news reports that you shouldn"]
 
 CUSTOM_FOOTER = (
     "\n\n------------------------------\n"
-    "Source: The Punch\n"
-    "Brought by: RAC-FUTO Editorial Team"
+    "✨ *Customized Daily Briefing*\n"
+    "Have a productive and great day ahead!"
 )
 
 
@@ -34,7 +33,6 @@ def fetch_and_modify_target_post(page_name):
     target_item = None
     for item in items:
         content = (item.get("description", "") or item.get("title", "")).lower()
-        # Check if any key phrase matches the post
         if any(keyword in content for keyword in KEYWORDS):
             target_item = item
             break
@@ -46,10 +44,8 @@ def fetch_and_modify_target_post(page_name):
     post_text = target_item.get("description", target_item.get("title", ""))
     link = target_item.get("link", "")
 
-    # Split into paragraphs and strip empty lines
     paragraphs = [p.strip() for p in post_text.split("\n") if p.strip()]
 
-    # Remove the original last paragraph/footer
     if len(paragraphs) > 1:
         paragraphs = paragraphs[:-1]
 
@@ -92,7 +88,14 @@ def main():
     message = fetch_and_modify_target_post(FB_PAGE_NAME)
 
     if not message:
-        print("Skipping delivery.")
+        # Send notification instead of skipping silently
+        fallback_msg = (
+            "⚠️ *Daily Update Notice*\n\n"
+            "Punch Newspapers has not published 'Today's Biggest Headlines' yet this morning."
+        )
+        send_whatsapp_green_api(
+            ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, fallback_msg
+        )
         return
 
     send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, message)
