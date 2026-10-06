@@ -12,17 +12,16 @@ PUNCH_FRONTPAGE_URL = "https://punchng.com/topics/frontpage/"
 
 
 def capture_frontpage_with_playwright():
-    """Launches a real headless browser with Playwright to render the front-page section
+    """Launches Playwright Chromium to render Punch's page, bypasses strict element selectors,
 
-    and extract the high-resolution cover image binary directly from the DOM.
+    and extracts the top front-page image or element screenshot.
     """
     print("🚀 Launching Headless Chromium with Playwright...")
     try:
         with sync_playwright() as p:
-            # Launch Chromium with a realistic desktop viewport
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(
-                viewport={"width": 1280, "height": 800},
+                viewport={"width": 1280, "height": 900},
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -32,29 +31,38 @@ def capture_frontpage_with_playwright():
             page = context.new_page()
 
             print(f"🌐 Navigating to: {PUNCH_FRONTPAGE_URL}")
-            page.goto(PUNCH_FRONTPAGE_URL, wait_until="networkidle", timeout=30000)
+            # Wait for DOM content rather than full networkidle to prevent page hang
+            page.goto(PUNCH_FRONTPAGE_URL, wait_until="domcontentloaded", timeout=30000)
 
-            # Wait explicitly for post card image elements to load in the DOM
-            page.wait_for_selector("article img", timeout=15000)
+            # Scroll down slightly to trigger lazy-loaded images
+            page.evaluate("window.scrollBy(0, 500)")
+            page.wait_for_timeout(3000)
 
-            # Extract the main front-page image element
-            img_element = page.query_selector("article img")
+            # Strategy A: Find all img elements on the page and filter out icons/logos
+            images = page.query_selector_all("img")
+            print(f"🔍 Evaluated {len(images)} image tags on page...")
 
-            if img_element:
-                img_url = img_element.get_attribute("src") or img_element.get_attribute("data-src")
-                print(f"🖼️ Found rendered front-page image URL: {img_url}")
+            for img in images:
+                src = img.get_attribute("src") or img.get_attribute("data-src") or ""
+                # Ignore logos, icons, avatars, and ads
+                if "uploads" in src and not any(k in src.lower() for k in ["logo", "avatar", "icon", "50x50", "150x150"]):
+                    print(f"🖼️ Direct cover image isolated: {src}")
+                    image_bytes = img.screenshot()
+                    browser.close()
+                    if image_bytes and len(image_bytes) > 8000:
+                        return image_bytes, src
 
-                # Take an exact screenshot of the image element itself
-                image_bytes = img_element.screenshot()
+            # Strategy B: Fallback - capture a visual screenshot of the top story container
+            main_container = page.query_selector("main") or page.query_selector("#primary")
+            if main_container:
+                print("📸 Capturing visual screenshot of the main front-page container...")
+                image_bytes = main_container.screenshot()
                 browser.close()
-
-                if image_bytes and len(image_bytes) > 5000:
-                    print(f"✅ Successfully captured {len(image_bytes)} bytes of cover photo!")
-                    return image_bytes, img_url
+                return image_bytes, PUNCH_FRONTPAGE_URL
 
             browser.close()
     except Exception as e:
-        print(f"❌ Playwright execution error: {e}")
+        print(f"❌ Playwright capture error: {e}")
 
     return None, None
 
