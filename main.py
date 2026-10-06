@@ -105,9 +105,9 @@ def fetch_and_build_content():
         headline_lines.append(f"{idx}. {t_text}\n\n=== {l_text}")
 
     custom_footer = (
-        "\n\n------------------------------\n"
-        "✨ *Customized Daily Briefing*\n"
-        "Have a productive and great day ahead!"
+        "\n\n \n"
+        "*Source:* The Punch\n"
+        "*Brought by:* RAC-FUTO Editorial Team"
     )
 
     message_text = "\n\n".join(headline_lines) + custom_footer
