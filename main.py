@@ -4,17 +4,15 @@ import requests
 
 ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
-PHONE_NUMBERS = os.getenv(
-    "PHONE_NUMBER"
-)  # Accepts comma-separated numbers, e.g., 2348012345678,2349012345678
-FB_PAGE_NAME = os.getenv("FB_PAGE_NAME", "The Punch")
+PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
+FB_PAGE_NAME = os.getenv("FB_PAGE_NAME", "punchnewspaper")
 
-# Target phrase to filter for the 5:00 AM post
-KEYWORD_TARGET = "Today's Biggest Headlines"
+# Broad keywords so variations like "Today's", "Today’s", or minor phrasing won't cause misses
+KEYWORDS = ["biggest headlines", "news reports that you shouldn"]
 
-# Custom footer you want to append at the end
 CUSTOM_FOOTER = (
-    "Source: The Punch"
+    "\n\n------------------------------\n"
+    "Source: The Punch\n"
     "Brought by: RAC-FUTO Editorial Team"
 )
 
@@ -33,33 +31,29 @@ def fetch_and_modify_target_post(page_name):
     data = response.json()
     items = data.get("items", [])
 
-    # Search through recent items for the post containing the keyword
     target_item = None
     for item in items:
-        content = item.get("description", "") or item.get("title", "")
-        if KEYWORD_TARGET.lower() in content.lower():
+        content = (item.get("description", "") or item.get("title", "")).lower()
+        # Check if any key phrase matches the post
+        if any(keyword in content for keyword in KEYWORDS):
             target_item = item
             break
 
     if not target_item:
-        print(f"No post found matching phrase: '{KEYWORD_TARGET}'")
+        print("Target headline post not published yet or not found.")
         return None
 
-    # Get the main post body text
     post_text = target_item.get("description", target_item.get("title", ""))
     link = target_item.get("link", "")
 
-    # Split text into paragraphs
+    # Split into paragraphs and strip empty lines
     paragraphs = [p.strip() for p in post_text.split("\n") if p.strip()]
 
-    # Remove the last paragraph if there are multiple paragraphs
+    # Remove the original last paragraph/footer
     if len(paragraphs) > 1:
         paragraphs = paragraphs[:-1]
 
-    # Reassemble remaining paragraphs
     cleaned_body = "\n\n".join(paragraphs)
-
-    # Append link and custom footer
     final_message = f"{cleaned_body}\n\n🔗 *Full Post:* {link}{CUSTOM_FOOTER}"
     return final_message
 
@@ -98,9 +92,7 @@ def main():
     message = fetch_and_modify_target_post(FB_PAGE_NAME)
 
     if not message:
-        print(
-            "Target headline post not published yet or not found. Skipping delivery."
-        )
+        print("Skipping delivery.")
         return
 
     send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, message)
