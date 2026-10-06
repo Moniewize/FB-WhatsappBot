@@ -1,80 +1,44 @@
 import os
+import re
 import xml.etree.ElementTree as ET
 import requests
-from playwright.sync_api import sync_playwright
 
 ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
 
 PUNCH_OFFICIAL_RSS = "https://rss.punchng.com/v1/category/latest_news"
-PUNCH_FRONTPAGE_URL = "https://punchng.com/topics/frontpage/"
 
 
-def capture_frontpage_with_playwright():
-    """Renders Punch in Playwright, extracts valid image CDN URLs, and fetches 
+def extract_cover_image_from_item(item):
+    """Extracts the direct cover image URL attached to the daily headlines RSS post."""
+    # 1. Check for RSS media enclosure tag (<enclosure url="..." type="image/jpeg" />)
+    enclosure = item.find("enclosure")
+    if enclosure is None:
+        # Search namespace variations for enclosure
+        for elem in item:
+            if "enclosure" in elem.tag:
+                enclosure = elem
+                break
 
-    the raw image binary directly via requests to prevent element visibility timeouts.
-    """
-    print("🚀 Launching Headless Chromium with Playwright...")
-    target_urls = [
-        "https://punchng.com",
-        "https://punchng.com/topics/frontpage/",
-    ]
+    if enclosure is not None:
+        img_url = enclosure.get("url")
+        if img_url and "uploads" in img_url:
+            print(f"🖼️ [DEBUG] Found image in RSS enclosure: {img_url}")
+            return img_url
 
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
-                ),
-            )
-            page = context.new_page()
+    # 2. Check content:encoded or description HTML body for embedded <img> tags
+    for elem in item:
+        if "encoded" in elem.tag or "description" in elem.tag:
+            html_text = elem.text or ""
+            img_matches = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html_text)
+            for src in img_matches:
+                if "uploads" in src and not any(k in src.lower() for k in ["logo", "avatar", "icon", "150x150"]):
+                    print(f"🖼️ [DEBUG] Found image embedded in RSS item HTML: {src}")
+                    return src
 
-            for url in target_urls:
-                print(f"🌐 Navigating to: {url}")
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                page.evaluate("window.scrollBy(0, 400)")
-                page.wait_for_timeout(2000)
+    return None
 
-                # Collect all img src and data-src attributes
-                images = page.query_selector_all("img")
-                print(f"🔍 Evaluated {len(images)} image tags on page...")
-
-                for img in images:
-                    src = img.get_attribute("src") or img.get_attribute("data-src") or ""
-                    
-                    # Filter out logos, 404 placeholders, avatars, and tiny icons
-                    if "uploads" in src and not any(
-                        k in src.lower() for k in ["logo", "avatar", "icon", "404", "50x50", "150x150"]
-                    ):
-                        print(f"🖼️ Found candidate cover image URL: {src}")
-                        
-                        # Download binary directly via requests instead of Playwright screenshot()
-                        # This avoids "element is not visible" / scrolling timeouts completely!
-                        try:
-                            res = requests.get(src, timeout=10)
-                            if res.status_code == 200 and len(res.content) > 10000:
-                                print(f"✅ Successfully downloaded {len(res.content)} bytes directly from CDN!")
-                                browser.close()
-                                return res.content, src
-                        except Exception as req_err:
-                            print(f"Failed direct download from {src}: {req_err}")
-
-            # Fallback: Take a direct screenshot of the full viewport (guaranteed not to time out on element visibility)
-            print("📸 Fallback: Taking viewport screenshot of rendered page...")
-            viewport_bytes = page.screenshot(type="jpeg", quality=80)
-            browser.close()
-            return viewport_bytes, "https://punchng.com"
-
-    except Exception as e:
-        print(f"❌ Playwright capture error: {e}")
-
-    return None, None
 
 def fetch_and_build_content():
     headers = {
@@ -88,23 +52,26 @@ def fetch_and_build_content():
         response = requests.get(PUNCH_OFFICIAL_RSS, headers=headers, timeout=15)
         if response.status_code != 200:
             print(f"Failed to fetch Punch RSS. Status: {response.status_code}")
-            return None, None
+            return None, None, None
     except Exception as e:
         print(f"Exception fetching RSS: {e}")
-        return None, None
+        return None, None, None
 
     try:
         root = ET.fromstring(response.content)
     except Exception as e:
         print(f"Failed to parse XML: {e}")
-        return None, None
+        return None, None, None
 
     channel = root.find("channel")
     if channel is None:
-        return None, None
+        return None, None, None
 
     items = channel.findall("item")
     print(f"--- Fetched {len(items)} items from Punch RSS ---")
+
+    if not items:
+        return None, None, None
 
     # Message 1: Top 10 Headlines Digest
     intro_header = (
@@ -122,20 +89,42 @@ def fetch_and_build_content():
         headline_lines.append(f"{idx}. {t_text}\n\n=== {l_text}")
 
     custom_footer = (
-        "\n\n \n"
-        "*Source:* The Punch\n"
-        "*Brought by:* RAC-FUTO Editorial Team"
+        "\n\n------------------------------\n"
+        "✨ *Customized Daily Briefing*\n"
+        "Have a productive and great day ahead!"
     )
 
-    message_text = "\n\n".join(headline_lines) + custom_footer
+    first_message = "\n\n".join(headline_lines) + custom_footer
 
-    # Capture front-page photo binary with Playwright
-    image_bytes, _ = capture_frontpage_with_playwright()
+    # Extract attached cover image directly from the headline RSS post
+    first_item = items[0]
+    cover_image_url = extract_cover_image_from_item(first_item)
+    
+    first_item_link = first_item.find("link")
+    fallback_link = first_item_link.text.strip() if first_item_link is not None else "https://punchng.com"
 
-    return message_text, image_bytes
+    image_bytes = None
+    if cover_image_url:
+        try:
+            print(f"🔄 [DEBUG] Downloading image directly from CDN: {cover_image_url}")
+            img_res = requests.get(cover_image_url, headers=headers, timeout=15)
+            if img_res.status_code == 200 and len(img_res.content) > 5000:
+                print(f"✅ Successfully downloaded {len(img_res.content)} bytes of frontpage cover image!")
+                image_bytes = img_res.content
+        except Exception as img_err:
+            print(f"❌ Failed to download cover image binary: {img_err}")
+
+    # Message 2: Link Fallback / Source Reference
+    second_message = (
+        "📰 *Official Story & Cover Page Link*\n\n"
+        "Tap here to view today's lead story and newspaper cover online:\n"
+        f"{fallback_link}"
+    )
+
+    return first_message, second_message, image_bytes
 
 
-def send_whatsapp_green_api(id_instance, api_token, raw_phones, message_text, image_bytes):
+def send_whatsapp_green_api(id_instance, api_token, raw_phones, msg1, msg2, image_bytes):
     recipient_list = [p.strip() for p in raw_phones.split(",") if p.strip()]
 
     for recipient in recipient_list:
@@ -146,19 +135,25 @@ def send_whatsapp_green_api(id_instance, api_token, raw_phones, message_text, im
         else:
             chat_id = f"{clean_recipient}@c.us"
 
-        # 1. Send the rendered Cover Image directly to WhatsApp (if captured)
+        msg_url = f"https://api.green-api.com/waInstance{id_instance}/sendMessage/{api_token}"
+        headers = {"Content-Type": "application/json"}
+
+        # Message 1: Send Headlines Digest
+        res1 = requests.post(msg_url, json={"chatId": chat_id, "message": msg1}, headers=headers)
+        print(f"Headlines Delivery Status ({chat_id}):", res1.json())
+
+        # Direct Image Upload (if image binary was fetched)
         if image_bytes:
             upload_url = f"https://api.green-api.com/waInstance{id_instance}/sendFileByUpload/{api_token}"
             payload = {"chatId": chat_id, "fileName": "punch_frontpage.jpg"}
             files = {"file": ("punch_frontpage.jpg", image_bytes, "image/jpeg")}
             res_img = requests.post(upload_url, data=payload, files=files)
-            print(f"Front-Page Image Direct Delivery ({chat_id}):", res_img.json())
+            print(f"Front-Page Image Direct Delivery Status ({chat_id}):", res_img.json())
 
-        # 2. Send the Top 10 Headlines block
-        headers = {"Content-Type": "application/json"}
-        msg_url = f"https://api.green-api.com/waInstance{id_instance}/sendMessage/{api_token}"
-        res_msg = requests.post(msg_url, json={"chatId": chat_id, "message": message_text}, headers=headers)
-        print(f"Headlines Delivery ({chat_id}):", res_msg.json())
+        # Message 2: Send Link Reference Message
+        if msg2:
+            res2 = requests.post(msg_url, json={"chatId": chat_id, "message": msg2}, headers=headers)
+            print(f"Link Reference Delivery Status ({chat_id}):", res2.json())
 
 
 def main():
@@ -174,17 +169,17 @@ def main():
         print(f"Error: Missing environment variables: {', '.join(missing)}")
         return
 
-    message_text, image_bytes = fetch_and_build_content()
+    msg1, msg2, image_bytes = fetch_and_build_content()
 
-    if not message_text:
+    if not msg1:
         fallback_msg = (
             "⚠️ *Daily Update Notice*\n\n"
             "Punch Newspapers has not published 'Today's Biggest Headlines' yet this morning."
         )
-        send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, fallback_msg, None)
+        send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, fallback_msg, "", None)
         return
 
-    send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, message_text, image_bytes)
+    send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, msg1, msg2, image_bytes)
 
 
 if __name__ == "__main__":
