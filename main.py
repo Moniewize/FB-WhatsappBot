@@ -36,9 +36,7 @@ def fetch_and_modify_target_post():
     try:
         response = requests.get(PUNCH_OFFICIAL_RSS, headers=headers, timeout=15)
         if response.status_code != 200:
-            print(
-                f"Failed to fetch Punch RSS. Status code: {response.status_code}"
-            )
+            print(f"Failed to fetch Punch RSS. Status code: {response.status_code}")
             return None, None
     except Exception as e:
         print(f"Exception while fetching RSS feed: {e}")
@@ -59,7 +57,6 @@ def fetch_and_modify_target_post():
     print(f"--- Punch Native RSS: Fetched {len(items)} items ---")
 
     target_item = None
-    # 1. Search top feed items for morning digest match
     for item in items:
         title_elem = item.find("title")
         desc_elem = item.find("description")
@@ -73,7 +70,12 @@ def fetch_and_modify_target_post():
             target_item = item
             break
 
-    # 2. Fallback: Aggregate top 10 news stories into exact Punch layout
+    namespaces = {
+        "media": "http://search.yahoo.com/mrss/",
+        "content": "http://purl.org/rss/1.0/modules/content/",
+    }
+
+    # Aggregate top 10 headlines into exact Punch layout
     if target_item is None and len(items) >= 5:
         print("Generating structured headline digest matching Punch layout...")
         intro_header = (
@@ -83,11 +85,6 @@ def fetch_and_modify_target_post():
         headline_lines = [intro_header]
         cover_image = None
 
-        namespaces = {
-            "media": "http://search.yahoo.com/mrss/",
-            "content": "http://purl.org/rss/1.0/modules/content/",
-        }
-
         for idx, item in enumerate(items[:10], 1):
             t_elem = item.find("title")
             l_elem = item.find("link")
@@ -96,14 +93,11 @@ def fetch_and_modify_target_post():
 
             headline_lines.append(f"{idx}. {t_text}\n\n=== {l_text}")
 
-            # Grab image from first story
+            # Grab high-resolution image URL from the lead article
             if idx == 1:
                 media_content = item.find("media:content", namespaces)
                 enclosure = item.find("enclosure")
-                if (
-                    media_content is not None
-                    and media_content.attrib.get("url")
-                ):
+                if media_content is not None and media_content.attrib.get("url"):
                     cover_image = media_content.attrib.get("url")
                 elif enclosure is not None and enclosure.attrib.get("url"):
                     cover_image = enclosure.attrib.get("url")
@@ -115,23 +109,15 @@ def fetch_and_modify_target_post():
         print("Target headline post not found in RSS feed.")
         return None, None
 
-    # Processing matched digest item directly
+    # Processing matched post
     title_elem = target_item.find("title")
     desc_elem = target_item.find("description")
-    link_elem = target_item.find("link")
 
-    post_text = (
-        desc_elem.text if desc_elem is not None and desc_elem.text else ""
-    )
+    post_text = desc_elem.text if desc_elem is not None and desc_elem.text else ""
     if not post_text:
         post_text = title_elem.text if title_elem is not None else ""
 
     cover_image = None
-    namespaces = {
-        "media": "http://search.yahoo.com/mrss/",
-        "content": "http://purl.org/rss/1.0/modules/content/",
-    }
-
     media_content = target_item.find("media:content", namespaces)
     enclosure = target_item.find("enclosure")
 
@@ -142,7 +128,6 @@ def fetch_and_modify_target_post():
 
     paragraphs = [p.strip() for p in post_text.split("\n") if p.strip()]
 
-    # Strip last paragraph (original footer link)
     if len(paragraphs) > 1:
         paragraphs = paragraphs[:-1]
 
@@ -152,9 +137,7 @@ def fetch_and_modify_target_post():
     return final_message, cover_image
 
 
-def send_whatsapp_green_api(
-    id_instance, api_token, raw_phones, message, cover_image=None
-):
+def send_whatsapp_green_api(id_instance, api_token, raw_phones, message, cover_image=None):
     recipient_list = [p.strip() for p in raw_phones.split(",") if p.strip()]
 
     for recipient in recipient_list:
@@ -167,21 +150,18 @@ def send_whatsapp_green_api(
 
         headers = {"Content-Type": "application/json"}
 
-        # Step 1: Send Image with short headline title
+        # Step 1: Send high-res cover image as standalone media
         if cover_image:
             file_url = f"https://api.green-api.com/waInstance{id_instance}/sendFileByUrl/{api_token}"
             payload_image = {
                 "chatId": chat_id,
                 "urlFile": cover_image,
-                "fileName": "cover_page.jpg",
-                "caption": "Today's Biggest Headlines",
+                "fileName": "front_page.jpg",
             }
-            res_img = requests.post(
-                file_url, json=payload_image, headers=headers
-            )
-            print(f"Image Sent to {chat_id} - Response:", res_img.json())
+            res_img = requests.post(file_url, json=payload_image, headers=headers)
+            print(f"High-Res Image Sent to {chat_id} - Response:", res_img.json())
 
-        # Step 2: Send complete headlines, links, and custom footer in full text message
+        # Step 2: Send full 10-headline text block + links + custom footer
         msg_url = f"https://api.green-api.com/waInstance{id_instance}/sendMessage/{api_token}"
         payload_msg = {"chatId": chat_id, "message": message}
         res_msg = requests.post(msg_url, json=payload_msg, headers=headers)
@@ -198,9 +178,7 @@ def main():
         missing.append("PHONE_NUMBER")
 
     if missing:
-        print(
-            f"Error: Missing required environment variables: {', '.join(missing)}"
-        )
+        print(f"Error: Missing required environment variables: {', '.join(missing)}")
         return
 
     message, cover_image = fetch_and_modify_target_post()
@@ -210,14 +188,10 @@ def main():
             "⚠️ *Daily Update Notice*\n\n"
             "Punch Newspapers has not published 'Today's Biggest Headlines' yet this morning."
         )
-        send_whatsapp_green_api(
-            ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, fallback_msg
-        )
+        send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, fallback_msg)
         return
 
-    send_whatsapp_green_api(
-        ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, message, cover_image
-    )
+    send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, message, cover_image)
 
 
 if __name__ == "__main__":
