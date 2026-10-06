@@ -1,8 +1,7 @@
 import os
-import re
 import xml.etree.ElementTree as ET
-from bs4 import BeautifulSoup
 import requests
+from duckduckgo_search import DDGS
 
 ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
@@ -11,45 +10,40 @@ PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
 PUNCH_OFFICIAL_RSS = "https://rss.punchng.com/v1/category/latest_news"
 PUNCH_FB_PAGE_URL = "https://www.facebook.com/punchnewspaper"
 
-# Public Nitter instances providing RSS feeds for Twitter account @MobilePunch
-NITTER_RSS_INSTANCES = [
-    "https://nitter.net/MobilePunch/rss",
-    "https://nitter.poast.org/MobilePunch/rss",
-    "https://nitter.privacydev.net/MobilePunch/rss",
-    "https://nitter.freedit.eu/MobilePunch/rss",
-]
-
-
-from duckduckgo_search import DDGS
 
 def fetch_frontpage_image():
-    """Fetches Punch front page image using free DuckDuckGo search (No API key needed)."""
+    """Fetches Punch front page image using DuckDuckGo search."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
     }
-    
+
     try:
         print("🌐 Searching DuckDuckGo for Punch front page...")
-        results = list(DDGS().images("Punch newspaper front page today", max_results=5))
-        
+        with DDGS() as ddgs:
+            results = list(ddgs.images("Punch newspaper front page today", max_results=5))
+
         for item in results:
             img_url = item.get("image")
             print(f"📌 Found image candidate: {img_url}")
-            
+
             if img_url:
-                img_res = requests.get(img_url, headers=headers, timeout=15)
-                if img_res.status_code == 200 and len(img_res.content) > 10000:
-                    print(f"✅ Downloaded cover image ({len(img_res.content)} bytes)!")
-                    return img_res.content
-                    
+                try:
+                    img_res = requests.get(img_url, headers=headers, timeout=15)
+                    if img_res.status_code == 200 and len(img_res.content) > 10000:
+                        print(f"✅ Downloaded cover image ({len(img_res.content)} bytes)!")
+                        return img_res.content
+                except Exception as e:
+                    print(f"⚠️ Error downloading candidate {img_url}: {e}")
+
     except Exception as e:
         print(f"⚠️ DuckDuckGo Search Error: {e}")
-        
+
     print("❌ Scraper Warning: Could not retrieve cover image.")
     return None
+
 
 def fetch_and_build_messages():
     headers = {
@@ -84,7 +78,6 @@ def fetch_and_build_messages():
     if not items:
         return None, None
 
-    # Chat 1: Top 10 Headlines Digest
     intro_header = (
         "Today's Biggest Headlines\n\n"
         "Here are some of the news reports that you shouldn’t miss this morning:\n"
@@ -107,7 +100,6 @@ def fetch_and_build_messages():
 
     first_message = "\n\n".join(headline_lines) + custom_footer
 
-    # Chat 2: Official Facebook Page Link
     second_message = (
         "📰 *Official Newspaper Facebook Page*\n\n"
         "Tap here to visit Punch's official Facebook page:\n"
@@ -131,21 +123,21 @@ def send_whatsapp_green_api(id_instance, api_token, raw_phones, msg1, msg2, imag
 
         msg_url = f"https://api.green-api.com/waInstance{id_instance}/sendMessage/{api_token}"
 
-        # 1. Deliver Original Full-Resolution Image
         if image_bytes:
             upload_url = f"https://api.green-api.com/waInstance{id_instance}/sendFileByUpload/{api_token}"
             payload = {"chatId": chat_id, "fileName": "punch_frontpage.jpg"}
             files = {"file": ("punch_frontpage.jpg", image_bytes, "image/jpeg")}
-            res_img = requests.post(upload_url, data=payload, files=files)
-            print(f"Frontpage Cover Image Delivery to ({chat_id}):", res_img.json())
+            try:
+                res_img = requests.post(upload_url, data=payload, files=files, timeout=30)
+                print(f"Frontpage Cover Image Delivery to ({chat_id}):", res_img.json())
+            except Exception as e:
+                print(f"Failed to send image: {e}")
 
-        # 2. Deliver Headlines Digest
-        res1 = requests.post(msg_url, json={"chatId": chat_id, "message": msg1}, headers=headers)
+        res1 = requests.post(msg_url, json={"chatId": chat_id, "message": msg1}, headers=headers, timeout=15)
         print(f"Headlines Digest Sent to ({chat_id}):", res1.json())
 
-        # 3. Deliver Facebook Reference Link
         if msg2:
-            res2 = requests.post(msg_url, json={"chatId": chat_id, "message": msg2}, headers=headers)
+            res2 = requests.post(msg_url, json={"chatId": chat_id, "message": msg2}, headers=headers, timeout=15)
             print(f"Facebook Reference Link Sent to ({chat_id}):", res2.json())
 
 
@@ -172,9 +164,7 @@ def main():
         send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, fallback_msg, None, None)
         return
 
-    # Fetch original frontpage image from Twitter/Nitter RSS feed
     image_bytes = fetch_frontpage_image()
-
     send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, first_message, second_message, image_bytes)
 
 
