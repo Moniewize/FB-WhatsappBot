@@ -1,3 +1,2 @@
 vrequests
 beautifulsoup4
-playwright

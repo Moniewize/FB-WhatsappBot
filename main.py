@@ -1,89 +1,78 @@
 import os
 import re
 import xml.etree.ElementTree as ET
+from bs4 import BeautifulSoup
 import requests
-from playwright.sync_api import sync_playwright
 
 ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
 
 PUNCH_OFFICIAL_RSS = "https://rss.punchng.com/v1/category/latest_news"
-FRONTPAGES_PUNCH_URL = "https://www.frontpages.com/the-punch/"
 PUNCH_FB_PAGE_URL = "https://www.facebook.com/punchnewspaper"
 
+# Public Nitter instances providing RSS feeds for Twitter account @MobilePunch
+NITTER_RSS_INSTANCES = [
+    "https://nitter.net/MobilePunch/rss",
+    "https://nitter.poast.org/MobilePunch/rss",
+    "https://nitter.privacydev.net/MobilePunch/rss",
+    "https://nitter.freedit.eu/MobilePunch/rss",
+]
 
-def fetch_frontpage_cover_image():
-    """Renders JS via Playwright to extract and download the direct high-res image binary."""
-    print(f"🌐 Playwright: Launching headless browser for {FRONTPAGES_PUNCH_URL}...")
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                )
-            )
-            page = context.new_page()
 
-            # Wait until DOM and network requests settle
-            page.goto(FRONTPAGES_PUNCH_URL, wait_until="networkidle", timeout=30000)
+def fetch_twitter_frontpage_image():
+    """Fetches Punch's latest front-page image via Twitter (Nitter RSS feed)."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
 
-            img_url = None
+    for rss_url in NITTER_RSS_INSTANCES:
+        try:
+            print(f"🌐 Fetching Twitter RSS feed from: {rss_url}...")
+            res = requests.get(rss_url, headers=headers, timeout=12)
+            print(f"📡 Twitter RSS Status: {res.status_code}")
 
-            # Strategy 1: Look for <a> tags linking directly to high-res image files
-            anchors = page.query_selector_all("a[href]")
-            for a in anchors:
-                href = a.get_attribute("href") or ""
-                if re.search(r"\.(jpg|jpeg|png)($|\?)", href, re.I):
-                    if not any(skip in href.lower() for skip in ["logo", "icon", "avatar", "banner", "150x150"]):
-                        img_url = href
-                        print(f"🖼️ Found full-res image URL in anchor tag: {img_url}")
-                        break
+            if res.status_code != 200:
+                continue
 
-            # Strategy 2: Check dynamically rendered <img> tags
-            if not img_url:
-                imgs = page.query_selector_all("img")
-                for img in imgs:
-                    src = img.get_attribute("src") or img.get_attribute("data-src") or ""
-                    if re.search(r"\.(jpg|jpeg|png)", src, re.I):
-                        if not any(skip in src.lower() for skip in ["logo", "icon", "avatar", "150x150"]):
-                            img_url = src
-                            print(f"🖼️ Found full-res image URL in <img> element: {img_url}")
-                            break
+            root = ET.fromstring(res.content)
+            channel = root.find("channel")
+            if channel is None:
+                continue
 
-            browser.close()
+            items = channel.findall("item")
+            print(f"--- Fetched {len(items)} items from Twitter RSS ---")
 
-            if not img_url:
-                print("❌ Playwright Warning: No cover image element detected in rendered DOM.")
-                return None
+            for item in items:
+                title = item.find("title").text if item.find("title") is not None else ""
+                description = item.find("description").text if item.find("description") is not None else ""
 
-            # Ensure complete URL schema
-            if img_url.startswith("//"):
-                img_url = "https:" + img_url
-            elif img_url.startswith("/"):
-                img_url = "https://www.frontpages.com" + img_url
+                # Check if tweet mentions front page or paper
+                combined_text = (title + " " + description).lower()
+                if any(kw in combined_text for kw in ["front page", "newspaper", "today's paper", "punch front page", "cover"]):
+                    print(f"📌 Found potential Front Page Tweet: {title[:60]}...")
 
-            # Download original high-resolution image binary directly
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                )
-            }
-            print(f"🔄 Downloading original full-resolution image from: {img_url}")
-            img_res = requests.get(img_url, headers=headers, timeout=20)
+                    # Parse HTML in description tag for high-res media attachment image
+                    soup = BeautifulSoup(description, "html.parser")
+                    img_tag = soup.find("img")
 
-            if img_res.status_code == 200 and len(img_res.content) > 10000:
-                print(f"✅ Downloaded full-resolution cover image ({len(img_res.content)} bytes)!")
-                return img_res.content
-            else:
-                print(f"❌ Image download failed. Status: {img_res.status_code}, Length: {len(img_res.content)} bytes")
+                    if img_tag and img_tag.get("src"):
+                        img_url = img_tag["src"]
+                        print(f"🖼️ Extracted image URL from tweet: {img_url}")
 
-    except Exception as e:
-        print(f"❌ Error during Playwright execution: {e}")
+                        # Download direct high-res image binary
+                        img_res = requests.get(img_url, headers=headers, timeout=20)
+                        if img_res.status_code == 200 and len(img_res.content) > 10000:
+                            print(f"✅ Successfully downloaded cover image ({len(img_res.content)} bytes)!")
+                            return img_res.content
 
+        except Exception as e:
+            print(f"⚠️ Error checking instance {rss_url}: {e}")
+
+    print("❌ Scraper Warning: Could not retrieve front-page image from Twitter RSS feeds.")
     return None
 
 
@@ -208,7 +197,8 @@ def main():
         send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, fallback_msg, None, None)
         return
 
-    image_bytes = fetch_frontpage_cover_image()
+    # Fetch original frontpage image from Twitter/Nitter RSS feed
+    image_bytes = fetch_twitter_frontpage_image()
 
     send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, first_message, second_message, image_bytes)
 
