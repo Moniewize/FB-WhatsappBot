@@ -6,7 +6,6 @@ import requests
 ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
-FB_PAGE_NAME = os.getenv("FB_PAGE_NAME", "punchnewspaper")
 
 KEYWORDS = [
     "biggest headlines",
@@ -18,15 +17,14 @@ KEYWORDS = [
 
 CUSTOM_FOOTER = (
     "\n\n------------------------------\n"
-    "✨ *Customized Daily Briefing*\n"
-    "Have a productive and great day ahead!"
+    "Source: The Punch \n"
+    "Brought by: RAC-FUTO Editorial team"
 )
 
+PUNCH_OFFICIAL_RSS = "https://rss.punchng.com/v1/category/latest_news"
 
-def fetch_and_modify_target_post(page_name):
-    # Fetch RSS XML directly from rss.app without third-party converters
-    rss_url = f"https://rss.app/feeds/v1/facebook/{page_name}.xml"
 
+def fetch_and_modify_target_post():
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -36,10 +34,10 @@ def fetch_and_modify_target_post(page_name):
     }
 
     try:
-        response = requests.get(rss_url, headers=headers, timeout=15)
+        response = requests.get(PUNCH_OFFICIAL_RSS, headers=headers, timeout=15)
         if response.status_code != 200:
             print(
-                f"Failed to fetch direct RSS XML. Status code: {response.status_code}"
+                f"Failed to fetch Punch RSS. Status code: {response.status_code}"
             )
             return None, None
     except Exception as e:
@@ -52,16 +50,16 @@ def fetch_and_modify_target_post(page_name):
         print(f"Failed to parse XML content: {e}")
         return None, None
 
-    # Standard RSS items are inside <channel><item>...
     channel = root.find("channel")
     if channel is None:
         print("Invalid RSS feed structure (no channel element found).")
         return None, None
 
     items = channel.findall("item")
-    print(f"--- Direct XML Debug: Fetched {len(items)} items ---")
+    print(f"--- Punch Native RSS: Fetched {len(items)} items ---")
 
     target_item = None
+    # 1. Search top feed items for morning digest match
     for item in items:
         title_elem = item.find("title")
         desc_elem = item.find("description")
@@ -75,11 +73,47 @@ def fetch_and_modify_target_post(page_name):
             target_item = item
             break
 
+    # 2. If no single digest post is found, aggregate top 10 latest news stories into 1 digest
+    if target_item is None and len(items) >= 5:
+        print(
+            "No single Facebook digest post found in feed. Generating structured headline digest from top news..."
+        )
+        headline_lines = ["📰 *Today's Biggest Headlines*\n"]
+        cover_image = None
+
+        namespaces = {
+            "media": "http://search.yahoo.com/mrss/",
+            "content": "http://purl.org/rss/1.0/modules/content/",
+        }
+
+        for idx, item in enumerate(items[:10], 1):
+            t_elem = item.find("title")
+            l_elem = item.find("link")
+            t_text = t_elem.text.strip() if t_elem is not None else ""
+            l_text = l_elem.text.strip() if l_elem is not None else ""
+
+            headline_lines.append(f"{idx}. *{t_text}*\n🔗 {l_text}")
+
+            # Grab cover image from the first story item
+            if idx == 1:
+                media_content = item.find("media:content", namespaces)
+                enclosure = item.find("enclosure")
+                if (
+                    media_content is not None
+                    and media_content.attrib.get("url")
+                ):
+                    cover_image = media_content.attrib.get("url")
+                elif enclosure is not None and enclosure.attrib.get("url"):
+                    cover_image = enclosure.attrib.get("url")
+
+        final_message = "\n\n".join(headline_lines) + CUSTOM_FOOTER
+        return final_message, cover_image
+
     if target_item is None:
-        print("Target headline post not matched in current direct XML feed.")
+        print("Target headline post not found in RSS feed.")
         return None, None
 
-    # Extract text & link
+    # Processing matched digest item
     title_elem = target_item.find("title")
     desc_elem = target_item.find("description")
     link_elem = target_item.find("link")
@@ -92,29 +126,22 @@ def fetch_and_modify_target_post(page_name):
 
     link = link_elem.text if link_elem is not None else ""
 
-    # Extract cover image from media:content or enclosure tags
     cover_image = None
-    # Check media:content / media:thumbnail
     namespaces = {
         "media": "http://search.yahoo.com/mrss/",
         "content": "http://purl.org/rss/1.0/modules/content/",
     }
 
     media_content = target_item.find("media:content", namespaces)
-    media_thumbnail = target_item.find("media:thumbnail", namespaces)
     enclosure = target_item.find("enclosure")
 
     if media_content is not None and media_content.attrib.get("url"):
         cover_image = media_content.attrib.get("url")
-    elif media_thumbnail is not None and media_thumbnail.attrib.get("url"):
-        cover_image = media_thumbnail.attrib.get("url")
     elif enclosure is not None and enclosure.attrib.get("url"):
         cover_image = enclosure.attrib.get("url")
 
-    # Format body paragraphs
     paragraphs = [p.strip() for p in post_text.split("\n") if p.strip()]
 
-    # Strip the original bottom paragraph (footer link)
     if len(paragraphs) > 1:
         paragraphs = paragraphs[:-1]
 
@@ -170,7 +197,7 @@ def main():
         )
         return
 
-    message, cover_image = fetch_and_modify_target_post(FB_PAGE_NAME)
+    message, cover_image = fetch_and_modify_target_post()
 
     if not message:
         fallback_msg = (
