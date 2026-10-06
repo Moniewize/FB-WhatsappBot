@@ -1,4 +1,5 @@
 import os
+import re
 import xml.etree.ElementTree as ET
 import requests
 from bs4 import BeautifulSoup
@@ -16,19 +17,16 @@ KEYWORDS = [
 ]
 
 CUSTOM_FOOTER = (
-    
-    "Source: The Punch"
-    "Brought by: RAC-FUTO Editorial Team"
+    "\n\n------------------------------\n"
+    "✨ *Customized Daily Briefing*\n"
+    "Have a productive and great day ahead!"
 )
 
 PUNCH_OFFICIAL_RSS = "https://rss.punchng.com/v1/category/latest_news"
 
 
-def extract_high_res_og_image(article_url):
-    """Scrapes the article page directly to find the full-resolution meta og:image."""
-    if not article_url:
-        return None
-    
+def fetch_newspaper_frontpage_image():
+    """Scrapes Punch's latest newspaper frontpage image directly."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -36,17 +34,34 @@ def extract_high_res_og_image(article_url):
             "Chrome/115.0.0.0 Safari/537.36"
         )
     }
-    
-    try:
-        resp = requests.get(article_url, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.content, "html.parser")
-            og_img = soup.find("meta", property="og:image")
-            if og_img and og_img.get("content"):
-                return og_img["content"]
-    except Exception as e:
-        print(f"Failed to scrape og:image from {article_url}: {e}")
-        
+
+    # Try Punch site's print/frontpage section first
+    urls_to_check = [
+        "https://punchng.com/topics/frontpage/",
+        "https://punchng.com/topics/news/",
+    ]
+
+    for site_url in urls_to_check:
+        try:
+            resp = requests.get(site_url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.content, "html.parser")
+                # Look for frontpage or paper image tags
+                for img in soup.find_all("img"):
+                    src = img.get("src") or img.get("data-src") or ""
+                    if src and any(
+                        term in src.lower()
+                        for term in [
+                            "frontpage",
+                            "cover",
+                            "paper",
+                            "punch-newspaper",
+                        ]
+                    ):
+                        return src
+        except Exception as e:
+            print(f"Error checking {site_url}: {e}")
+
     return None
 
 
@@ -62,7 +77,9 @@ def fetch_and_modify_target_post():
     try:
         response = requests.get(PUNCH_OFFICIAL_RSS, headers=headers, timeout=15)
         if response.status_code != 200:
-            print(f"Failed to fetch Punch RSS. Status code: {response.status_code}")
+            print(
+                f"Failed to fetch Punch RSS. Status code: {response.status_code}"
+            )
             return None, None
     except Exception as e:
         print(f"Exception while fetching RSS feed: {e}")
@@ -96,7 +113,10 @@ def fetch_and_modify_target_post():
             target_item = item
             break
 
-    # Aggregate top 10 headlines into exact Punch layout
+    # Fetch actual newspaper front-page cover photo
+    cover_image_url = fetch_newspaper_frontpage_image()
+
+    # Aggregate top 10 headlines matching exact Punch format
     if target_item is None and len(items) >= 5:
         print("Generating structured headline digest matching Punch layout...")
         intro_header = (
@@ -104,9 +124,6 @@ def fetch_and_modify_target_post():
             "Here are some of the news reports that you shouldn’t miss this morning:\n"
         )
         headline_lines = [intro_header]
-        cover_image_url = None
-
-        first_article_link = ""
 
         for idx, item in enumerate(items[:10], 1):
             t_elem = item.find("title")
@@ -114,14 +131,7 @@ def fetch_and_modify_target_post():
             t_text = t_elem.text.strip() if t_elem is not None else ""
             l_text = l_elem.text.strip() if l_elem is not None else ""
 
-            if idx == 1:
-                first_article_link = l_text
-
             headline_lines.append(f"{idx}. {t_text}\n\n=== {l_text}")
-
-        # Fetch actual front-page/lead article cover photo via og:image scraping
-        if first_article_link:
-            cover_image_url = extract_high_res_og_image(first_article_link)
 
         final_message = "\n\n".join(headline_lines) + CUSTOM_FOOTER
         return final_message, cover_image_url
@@ -133,14 +143,12 @@ def fetch_and_modify_target_post():
     # Processing matched post
     title_elem = target_item.find("title")
     desc_elem = target_item.find("description")
-    link_elem = target_item.find("link")
 
-    post_text = desc_elem.text if desc_elem is not None and desc_elem.text else ""
+    post_text = (
+        desc_elem.text if desc_elem is not None and desc_elem.text else ""
+    )
     if not post_text:
         post_text = title_elem.text if title_elem is not None else ""
-
-    link_text = link_elem.text if link_elem is not None else ""
-    cover_image_url = extract_high_res_og_image(link_text)
 
     paragraphs = [p.strip() for p in post_text.split("\n") if p.strip()]
 
@@ -153,13 +161,16 @@ def fetch_and_modify_target_post():
     return final_message, cover_image_url
 
 
-def send_whatsapp_green_api(id_instance, api_token, raw_phones, message, cover_image_url=None):
+def send_whatsapp_green_api(
+    id_instance, api_token, raw_phones, message, cover_image_url=None
+):
     recipient_list = [p.strip() for p in raw_phones.split(",") if p.strip()]
 
-    # Download raw image bytes directly to memory if image URL exists
     image_bytes = None
     if cover_image_url:
-        print(f"Downloading cover image directly from: {cover_image_url}")
+        print(
+            f"Downloading print front-page image directly from: {cover_image_url}"
+        )
         try:
             res = requests.get(cover_image_url, timeout=15)
             if res.status_code == 200:
@@ -177,18 +188,20 @@ def send_whatsapp_green_api(id_instance, api_token, raw_phones, message, cover_i
         else:
             chat_id = f"{clean_recipient}@c.us"
 
-        # Step 1: Upload and send raw original image binary without modifying bits
+        # Step 1: Upload and send raw print newspaper cover image
         if image_bytes:
             upload_url = f"https://api.green-api.com/waInstance{id_instance}/sendFileByUpload/{api_token}"
             payload = {
                 "chatId": chat_id,
-                "fileName": "punch_front_page.jpg"
+                "fileName": "punch_front_page.jpg",
             }
             files = {
                 "file": ("punch_front_page.jpg", image_bytes, "image/jpeg")
             }
             res_img = requests.post(upload_url, data=payload, files=files)
-            print(f"Direct Binary Image Sent to {chat_id} - Response:", res_img.json())
+            print(
+                f"Front-Page Image Sent to {chat_id} - Response:", res_img.json()
+            )
 
         # Step 2: Send complete text block + links + custom footer
         headers = {"Content-Type": "application/json"}
@@ -208,7 +221,9 @@ def main():
         missing.append("PHONE_NUMBER")
 
     if missing:
-        print(f"Error: Missing required environment variables: {', '.join(missing)}")
+        print(
+            f"Error: Missing required environment variables: {', '.join(missing)}"
+        )
         return
 
     message, cover_image_url = fetch_and_modify_target_post()
@@ -218,10 +233,14 @@ def main():
             "⚠️ *Daily Update Notice*\n\n"
             "Punch Newspapers has not published 'Today's Biggest Headlines' yet this morning."
         )
-        send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, fallback_msg)
+        send_whatsapp_green_api(
+            ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, fallback_msg
+        )
         return
 
-    send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, message, cover_image_url)
+    send_whatsapp_green_api(
+        ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, message, cover_image_url
+    )
 
 
 if __name__ == "__main__":
