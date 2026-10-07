@@ -118,8 +118,8 @@ def fetch_and_build_messages():
 
     custom_footer = (
         "\n\n------------------------------\n"
-        "✨ *Customized Daily Briefing*\n"
-        "Have a productive and great day ahead!"
+        "*Source:* The Punch\n"
+        "*Brought by*: RAC-FUTO Editorial Team"
     )
 
     first_message = "\n\n".join(headline_lines) + custom_footer
