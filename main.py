@@ -1,128 +1,58 @@
 import os
 import re
-import xml.etree.ElementTree as ET
-from bs4 import BeautifulSoup
 import requests
+from facebook_scraper import get_posts
 
 ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
 
-PUNCH_OFFICIAL_RSS = "https://rss.punchng.com/v1/category/latest_news"
-PUNCH_EPAPER_URL = "https://epaper.punchng.com/"
+FB_PAGE = "punchnewspaper"
 PUNCH_FB_PAGE_URL = "https://www.facebook.com/punchnewspaper"
 
 
-def fetch_epaper_frontpage_image():
-    """Extracts the direct front-page cover image binary from Punch e-Paper portal using standard HTTP requests."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
-    }
+def fetch_punch_facebook_headlines():
+    """Scrapes Punch's official Facebook page for the morning 'Today's Biggest Headlines' post."""
+    print(f"🔍 Checking Punch Facebook page (@{FB_PAGE}) for morning headlines post...")
 
     try:
-        print(f"🌐 Requesting Punch e-Paper portal: {PUNCH_EPAPER_URL}...")
-        res = requests.get(PUNCH_EPAPER_URL, headers=headers, timeout=15)
-        print(f"📡 e-Paper HTTP Status: {res.status_code}")
+        # Fetch the top 10 latest posts from Punch's public page
+        for post in get_posts(FB_PAGE, pages=2):
+            post_text = post.get("text") or ""
 
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.content, "html.parser")
-            img_url = None
-
-            # Look for front-page image elements in e-paper landing page
-            for img in soup.find_all("img"):
-                src = img.get("src") or img.get("data-src") or ""
-                if any(kw in src.lower() for kw in ["cover", "frontpage", "edition", "paper", "thumb"]):
-                    img_url = src
-                    print(f"🖼️ Found potential cover image element: {img_url}")
-                    break
-
-            # Fallback: grab the first substantial image asset on the e-paper portal
-            if not img_url:
-                for img in soup.find_all("img"):
-                    src = img.get("src") or img.get("data-src") or ""
-                    if re.search(r"\.(jpg|jpeg|png)", src, re.I):
-                        if not any(skip in src.lower() for skip in ["logo", "icon", "banner", "avatar"]):
-                            img_url = src
-                            print(f"🖼️ Fallback image candidate found: {img_url}")
-                            break
-
-            if img_url:
-                # Ensure absolute URL schema
-                if img_url.startswith("//"):
-                    img_url = "https:" + img_url
-                elif img_url.startswith("/"):
-                    img_url = "https://epaper.punchng.com" + img_url
-
-                print(f"🔄 Downloading cover image binary from: {img_url}")
-                img_res = requests.get(img_url, headers=headers, timeout=20)
-                if img_res.status_code == 200 and len(img_res.content) > 10000:
-                    print(f"✅ Downloaded cover image ({len(img_res.content)} bytes)!")
-                    return img_res.content
+            # Identify the specific morning summary post
+            if "Today's Biggest Headlines" in post_text or "Here are some of the news" in post_text:
+                print("✅ Found 'Today's Biggest Headlines' post from Facebook!")
+                return clean_and_format_facebook_post(post_text)
 
     except Exception as e:
-        print(f"⚠️ Error fetching e-paper cover image: {e}")
+        print(f"⚠️ Error fetching from Facebook: {e}")
 
-    print("❌ Scraper Warning: Could not retrieve e-paper cover image.")
-    return None
+    print("❌ Could not locate the morning Facebook headlines post.")
+    return None, None
 
 
-def fetch_and_build_messages():
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
-    }
+def clean_and_format_facebook_post(raw_text):
+    """Trims the last unwanted paragraph, appends the custom footer, and formats for WhatsApp."""
+    # Split post into distinct paragraphs/blocks
+    paragraphs = [p.strip() for p in raw_text.split("\n\n") if p.strip()]
 
-    try:
-        response = requests.get(PUNCH_OFFICIAL_RSS, headers=headers, timeout=15)
-        if response.status_code != 200:
-            print(f"Failed to fetch Punch RSS. Status: {response.status_code}")
-            return None, None
-    except Exception as e:
-        print(f"Exception fetching RSS: {e}")
-        return None, None
+    # Trim the last paragraph if it contains promo text or boilerplate sign-offs
+    if len(paragraphs) > 1:
+        last_p = paragraphs[-1].lower()
+        if any(kw in last_p for kw in ["follow us", "read full", "punchng.com", "social media", "subscribe"]):
+            paragraphs.pop()
 
-    try:
-        root = ET.fromstring(response.content)
-    except Exception as e:
-        print(f"Failed to parse XML: {e}")
-        return None, None
-
-    channel = root.find("channel")
-    if channel is None:
-        return None, None
-
-    items = channel.findall("item")
-    print(f"--- Fetched {len(items)} items from Punch RSS ---")
-
-    if not items:
-        return None, None
-
-    intro_header = (
-        "Today's Biggest Headlines\n\n"
-        "Here are some of the news reports that you shouldn’t miss this morning:\n"
-    )
-    headline_lines = [intro_header]
-
-    for idx, item in enumerate(items[:10], 1):
-        t_elem = item.find("title")
-        l_elem = item.find("link")
-        t_text = t_elem.text.strip() if t_elem is not None else ""
-        l_text = l_elem.text.strip() if l_elem is not None else ""
-
-        headline_lines.append(f"{idx}. {t_text}\n\n=== {l_text}")
+    # Reconstruct body text
+    cleaned_body = "\n\n".join(paragraphs)
 
     custom_footer = (
-        "\n\n \n"
-        "*Source:* The Punch\n"
-        "*Brought by*: RAC-FUTO Editorial Team"
+        "\n\n------------------------------\n"
+        "✨ *Customized Daily Briefing*\n"
+        "Have a productive and great day ahead!"
     )
 
-    first_message = "\n\n".join(headline_lines) + custom_footer
+    first_message = cleaned_body + custom_footer
 
     second_message = (
         "📰 *Official Newspaper Facebook Page*\n\n"
@@ -133,36 +63,21 @@ def fetch_and_build_messages():
     return first_message, second_message
 
 
-def send_whatsapp_green_api(id_instance, api_token, raw_phones, msg1, msg2, image_bytes):
+def send_whatsapp_green_api(id_instance, api_token, raw_phones, msg1, msg2):
     recipient_list = [p.strip() for p in raw_phones.split(",") if p.strip()]
     headers = {"Content-Type": "application/json"}
 
     for recipient in recipient_list:
         clean_recipient = recipient.replace("+", "").replace(" ", "")
-
-        if "@g.us" in clean_recipient or "@c.us" in clean_recipient:
-            chat_id = clean_recipient
-        else:
-            chat_id = f"{clean_recipient}@c.us"
+        chat_id = clean_recipient if ("@g.us" in clean_recipient or "@c.us" in clean_recipient) else f"{clean_recipient}@c.us"
 
         msg_url = f"https://api.green-api.com/waInstance{id_instance}/sendMessage/{api_token}"
 
-        # 1. Deliver Cover Image if found
-        if image_bytes:
-            upload_url = f"https://api.green-api.com/waInstance{id_instance}/sendFileByUpload/{api_token}"
-            payload = {"chatId": chat_id, "fileName": "punch_frontpage.jpg"}
-            files = {"file": ("punch_frontpage.jpg", image_bytes, "image/jpeg")}
-            try:
-                res_img = requests.post(upload_url, data=payload, files=files, timeout=30)
-                print(f"Frontpage Cover Image Delivery to ({chat_id}):", res_img.json())
-            except Exception as e:
-                print(f"Failed to send image: {e}")
-
-        # 2. Deliver Headlines Digest
+        # 1. Send Main Facebook Headlines Message
         res1 = requests.post(msg_url, json={"chatId": chat_id, "message": msg1}, headers=headers, timeout=15)
-        print(f"Headlines Digest Sent to ({chat_id}):", res1.json())
+        print(f"Facebook Headlines Digest Sent to ({chat_id}):", res1.json())
 
-        # 3. Deliver Reference Link
+        # 2. Send Facebook Reference Link
         if msg2:
             res2 = requests.post(msg_url, json={"chatId": chat_id, "message": msg2}, headers=headers, timeout=15)
             print(f"Facebook Reference Link Sent to ({chat_id}):", res2.json())
@@ -181,18 +96,17 @@ def main():
         print(f"Error: Missing environment variables: {', '.join(missing)}")
         return
 
-    first_message, second_message = fetch_and_build_messages()
+    first_message, second_message = fetch_punch_facebook_headlines()
 
     if not first_message:
         fallback_msg = (
             "⚠️ *Daily Update Notice*\n\n"
-            "Punch Newspapers has not published 'Today's Biggest Headlines' yet this morning."
+            "Punch Newspapers has not published the 'Today's Biggest Headlines' post on Facebook yet."
         )
-        send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, fallback_msg, None, None)
+        send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, fallback_msg, None)
         return
 
-    image_bytes = fetch_epaper_frontpage_image()
-    send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, first_message, second_message, image_bytes)
+    send_whatsapp_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, first_message, second_message)
 
 
 if __name__ == "__main__":
