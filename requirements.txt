@@ -2,5 +2,4 @@ requests
 beautifulsoup4
 pillow
 playwright
-facebook-scraper
-lxml_html_clean
+ 
