@@ -117,7 +117,7 @@ def fetch_and_build_messages():
         headline_lines.append(f"{idx}. {t_text}\n\n=== {l_text}")
 
     custom_footer = (
-        "\n\n------------------------------\n"
+        "\n\n \n"
         "*Source:* The Punch\n"
         "*Brought by*: RAC-FUTO Editorial Team"
     )
