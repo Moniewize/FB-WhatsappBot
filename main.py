@@ -1,117 +1,189 @@
 import os
-import requests
+import re
+import sys
+import tempfile
+import time
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+
+import requests
+from rapidfuzz import fuzz, process
+from rapidocr import RapidOCR
+
+from cover import fetch_cover
 
 ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
+DRY_RUN = os.getenv("DRY_RUN") == "1"  # prints the message instead of sending it
 
-# Punch RSS Featured Category Endpoint (Curated Editor Choices)
-RSS_URL = "https://rss.punchng.com/v1/category/featured"
+PUNCH_OFFICIAL_RSS = "https://rss.punchng.com/v1/category/latest_news"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+MATCH_THRESHOLD = 0.80  # share of a title's distinctive letters found on the cover
+MAX_ITEMS = 10
 
 
-def fetch_punch_featured_stories(limit=10):
-    """Fetches and parses curated editor lead stories from Punch RSS XML feed."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
+def parse_date(text):
+    if not text:
+        return None
     try:
-        response = requests.get(RSS_URL, headers=headers, timeout=15)
-        if response.status_code != 200:
-            print(f"❌ Failed to fetch RSS XML. HTTP Status Code: {response.status_code}")
-            return []
-
-        # Parse XML tree
-        root = ET.fromstring(response.content)
-        items = root.findall("./channel/item")
-
-        stories = []
-        for item in items[:limit]:
-            title_node = item.find("title")
-            link_node = item.find("link")
-
-            title = title_node.text.strip() if title_node is not None and title_node.text else ""
-            link = link_node.text.strip() if link_node is not None and link_node.text else ""
-
-            if title and link:
-                stories.append({"title": title, "link": link})
-
-        return stories
-
-    except Exception as e:
-        print(f"❌ Error while fetching RSS feed: {e}")
-        return []
-
-
-def build_whatsapp_message(stories):
-    """Formats headlines and appends custom footer."""
-    if not stories:
+        moment = parsedate_to_datetime(text)
+        return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+    except Exception:
         return None
 
-    header = "*Today's Biggest Headlines*\n\nHere are some of the news reports that you shouldn’t miss this morning:\n\n"
-    body = ""
 
-    for idx, story in enumerate(stories, 1):
-        body += f"{idx}. {story['title']}\n=== {story['link']}\n\n"
+def read_feed():
+    response = requests.get(PUNCH_OFFICIAL_RSS, headers=HEADERS, timeout=20)
+    response.raise_for_status()
+    channel = ET.fromstring(response.content).find("channel")
+    items = []
+    for item in (channel.findall("item") if channel is not None else []):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        if title and link:
+            items.append({"title": title, "link": link,
+                          "published": parse_date(item.findtext("pubDate"))})
+    if not items:
+        raise ValueError("news feed returned no items")
+    return items
 
-    footer = (
-        " \n"
-        "*Source*: The Punch\n"
-        "*Brought by:*  RAC-FUTO Editorial Team !"
-    )
 
-    return header + body + footer
+def read_cover_text(image_bytes):
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as handle:
+        handle.write(image_bytes)
+        path = handle.name
+    try:
+        result = RapidOCR()(path)
+    finally:
+        os.remove(path)
+    return list(result.txts) if result is not None and result.txts else []
 
 
-def send_whatsapp_via_green_api(id_instance, api_token, raw_phones, message):
-    """Sends WhatsApp message to all recipient numbers stored in environment secret."""
-    recipient_list = [p.strip() for p in raw_phones.split(",") if p.strip()]
-    headers = {"Content-Type": "application/json"}
+def words_of(text):
+    return re.findall(r"[a-z0-9]+", text.lower())
 
-    for recipient in recipient_list:
-        clean_recipient = recipient.replace("+", "").replace(" ", "")
-        
-        # Determine if recipient is a group (@g.us) or individual (@c.us)
-        if "@g.us" in clean_recipient or "@c.us" in clean_recipient:
-            chat_id = clean_recipient
-        else:
-            chat_id = f"{clean_recipient}@c.us"
 
-        api_endpoint = f"https://api.green-api.com/waInstance{id_instance}/sendMessage/{api_token}"
-        payload = {"chatId": chat_id, "message": message}
+def coverage(title, cover_words):
+    """Share of the title's distinctive letters whose words appear on the cover."""
+    words = [w for w in words_of(title) if len(w) >= 4]
+    if len(words) < 3:
+        return 0.0
+    total = matched = 0
+    for word in words:
+        total += len(word)
+        if word in cover_words or process.extractOne(
+                word, cover_words, scorer=fuzz.ratio, score_cutoff=85):
+            matched += len(word)
+    return matched / total
 
+
+def choose_items(feed, cover_pieces):
+    cover_words = set(words_of(" ".join(cover_pieces)))
+    scored = sorted(((coverage(i["title"], cover_words), n, i) for n, i in enumerate(feed)),
+                    key=lambda row: (-row[0], row[1]))
+
+    print("\nBest-scoring feed stories (cover match, 1.00 = every word found):")
+    for score, _, item in scored[:15]:
+        print(f"  {score:.2f}  {item['title'][:90]}")
+
+    chosen = [i for score, _, i in scored if score >= MATCH_THRESHOLD][:MAX_ITEMS]
+    print(f"\nStories matched to the cover: {len(chosen)}")
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    for item in feed:  # fill remaining slots with the newest stories
+        if len(chosen) >= MAX_ITEMS:
+            break
+        if item not in chosen and (item["published"] is None or item["published"] > cutoff):
+            chosen.append(item)
+    return chosen[:MAX_ITEMS]
+
+
+def build_message(items):
+    lines = ["Today's Biggest Headlines\n\n"
+             "Here are some of the news reports that you shouldn't miss this morning:\n"]
+    for number, item in enumerate(items, 1):
+        lines.append(f"{number}. {item['title']} === {item['link']}")
+    footer = ("\n\n------------------------------\n"
+              "*Source:* The Punch\n"
+              "Brought by: RAC-FUTO Editorial Team")
+    return "\n\n".join(lines) + footer
+
+
+def green_post(endpoint, **kwargs):
+    link = f"https://api.green-api.com/waInstance{ID_INSTANCE}/{endpoint}/{API_TOKEN}"
+    response = requests.post(link, timeout=60, **kwargs)
+    response.raise_for_status()
+    return response.json()
+
+
+def chat_identifier(raw):
+    cleaned = raw.strip().replace("+", "").replace(" ", "")
+    return cleaned if ("@g.us" in cleaned or "@c.us" in cleaned) else f"{cleaned}@c.us"
+
+
+def deliver(message):
+    failures = []
+    for raw in (p for p in PHONE_NUMBERS.split(",") if p.strip()):
+        chat = chat_identifier(raw)
         try:
-            res = requests.post(api_endpoint, json=payload, headers=headers, timeout=15)
-            print(f"✅ Delivered to ({chat_id}):", res.json())
-        except Exception as e:
-            print(f"❌ Transmission Error for ({chat_id}): {e}")
+            green_post("sendMessage", json={"chatId": chat, "message": message})
+            print(f"Headlines delivered to {chat}")
+        except Exception as error:
+            failures.append(f"{chat}: {error}")
+            print(f"FAILED for {chat}: {error}")
+        time.sleep(3)
+    return failures
 
 
 def main():
-    # Validate required secrets
-    missing_secrets = []
-    if not ID_INSTANCE:
-        missing_secrets.append("GREEN_API_ID_INSTANCE")
-    if not API_TOKEN:
-        missing_secrets.append("GREEN_API_TOKEN")
-    if not PHONE_NUMBERS:
-        missing_secrets.append("PHONE_NUMBER")
+    if not DRY_RUN:
+        missing = [n for n, v in [("GREEN_API_ID_INSTANCE", ID_INSTANCE),
+                                  ("GREEN_API_TOKEN", API_TOKEN),
+                                  ("PHONE_NUMBER", PHONE_NUMBERS)] if not v]
+        if missing:
+            print(f"Missing environment variables: {', '.join(missing)}")
+            sys.exit(1)
 
-    if missing_secrets:
-        print(f"❌ Critical Error: Missing environment variables: {', '.join(missing_secrets)}")
-        return
+    problems = []
+    try:
+        feed = read_feed()
+        dates = [i["published"] for i in feed if i["published"]]
+        print(f"Feed stories: {len(feed)}. Oldest: {min(dates) if dates else 'unknown'}. "
+              f"Newest: {max(dates) if dates else 'unknown'}.")
+    except Exception as error:
+        problems.append(f"headlines: {error}")
+        feed = None
 
-    print("🔍 Fetching today's featured headlines from Punch...")
-    stories = fetch_punch_featured_stories(limit=10)
+    if feed is None:
+        message = ("Daily Update Notice\n\nThere was a technical problem fetching "
+                   "this morning's headlines. We are looking into it.")
+    else:
+        cover_pieces = []
+        try:
+            cover_pieces = read_cover_text(fetch_cover())
+            print(f"Text pieces read from the cover: {len(cover_pieces)}")
+            print("First 60:", cover_pieces[:60])
+        except Exception as error:
+            print(f"Cover could not be read ({error}). Using the newest stories only.")
+        message = build_message(choose_items(feed, cover_pieces))
 
-    if not stories:
-        print("❌ Could not extract any headlines from RSS feed.")
-        return
+    print("\n===== MESSAGE =====\n" + message + "\n===================")
 
-    message = build_whatsapp_message(stories)
-    print("📤 Sending WhatsApp broadcast via Green API...")
-    send_whatsapp_via_green_api(ID_INSTANCE, API_TOKEN, PHONE_NUMBERS, message)
+    if DRY_RUN:
+        print("Dry run: nothing was sent.")
+    else:
+        problems += deliver(message)
+
+    if problems:
+        print("PROBLEMS:", *problems, sep="\n- ")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
