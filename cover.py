@@ -1,77 +1,40 @@
 import io
 import os
-import re
+import subprocess
 import sys
 import time
 from datetime import datetime
-from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import requests
-from bs4 import BeautifulSoup
 from PIL import Image
+from playwright.sync_api import sync_playwright
 
 ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
 
 COVER_PAGE_LINK = "https://www.frontpages.com/the-punch/"
+COVER_SELECTOR = 'img[alt^="Cover The Punch"]'
 NIGERIA = ZoneInfo("Africa/Lagos")
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
-IMAGE_HEADERS = {
-    **HEADERS,
-    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-    "Referer": COVER_PAGE_LINK,
-}
-LINK_PATTERN = re.compile(
-    r'''((?:https?:)?(?://www\.frontpages\.com)?/[gt]/\d{4}/\d{2}/\d{2}/[^"'\s)<>\\]+)'''
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
 
-def candidate_links(html):
-    html = html.replace("\\/", "/")
-    soup = BeautifulSoup(html, "html.parser")
-
-    og_link = None
-    for tag in soup.find_all("meta"):
-        if (tag.get("property") == "og:image" or tag.get("name") == "og:image") and tag.get("content"):
-            og_link = urljoin(COVER_PAGE_LINK, tag["content"].strip())
-            break
-
-    links = []
-
-    def add(link):
-        if link and "the-punch-" in link.lower() and link not in links:
-            links.append(link)
-
-    # 1. The preview name is shortened, so find the full file name in the page source
-    if og_link:
-        folder, _, filename = og_link.rpartition("/")
-        stem = filename.split(".")[0]  # for example: the-punch-0658453se
-        full_names = set(re.findall(re.escape(stem) + r"[a-z0-9]*\.webp", html))
-        for full in sorted(full_names, key=len, reverse=True):
-            add(f"{folder}/{full}")
-
-    # 2. Any cover-looking address anywhere in the page source
-    for raw in LINK_PATTERN.findall(html):
-        add(urljoin(COVER_PAGE_LINK, raw.strip()))
-
-    # 3. Last resort: the shortened preview address itself
-    add(og_link)
-    return links
-
-
-def is_older_cover(link):
-    match = re.search(r"/g/(\d{4})/(\d{2})/(\d{2})/", link)
-    if not match:
-        return False
-    return "-".join(match.groups()) != datetime.now(NIGERIA).strftime("%Y-%m-%d")
+def launch_browser(playwright):
+    """Use the Chrome already installed on GitHub's machine; fall back to downloading one."""
+    try:
+        return playwright.chromium.launch(channel="chrome")
+    except Exception as error:
+        print(f"Installed Chrome not usable ({error}). Trying the bundled browser.")
+    try:
+        return playwright.chromium.launch()
+    except Exception:
+        print("Downloading a browser (one time, about a minute)...")
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+        return playwright.chromium.launch()
 
 
 def to_jpeg(data):
@@ -84,29 +47,63 @@ def to_jpeg(data):
 
 
 def fetch_cover():
-    page = requests.get(COVER_PAGE_LINK, headers=HEADERS, timeout=30)
-    page.raise_for_status()
-    links = candidate_links(page.text)
-    print(f"Page loaded. Candidate cover addresses: {links}")
-    if not links:
-        raise ValueError("no cover addresses found in the page")
-
-    notes = []
-    for link in links:
-        if is_older_cover(link):
-            notes.append(f"{link} -> older cover")
-            continue
+    with sync_playwright() as playwright:
+        browser = launch_browser(playwright)
         try:
-            response = requests.get(link, headers=IMAGE_HEADERS, timeout=60)
-            print(f"Tried {link} -> status {response.status_code}, "
-                  f"{response.headers.get('content-type')}, {len(response.content)} bytes")
-            response.raise_for_status()
-            if len(response.content) < 20_000:
-                raise ValueError("file too small to be a front page")
-            return to_jpeg(response.content)
-        except Exception as error:
-            notes.append(f"{link} -> {error}")
-    raise ValueError(" | ".join(notes))
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1280, "height": 2000},
+                device_scale_factor=2,
+            )
+            page = context.new_page()
+            page.goto(COVER_PAGE_LINK, wait_until="domcontentloaded", timeout=60_000)
+            page.wait_for_selector(COVER_SELECTOR, state="attached", timeout=30_000)
+
+            # Scroll the cover into view so the page starts loading it, then wait until it is loaded
+            page.evaluate(
+                "document.querySelector('%s').scrollIntoView({block: 'center'})" % COVER_SELECTOR
+            )
+            try:
+                page.wait_for_function(
+                    """() => {
+                        const img = document.querySelector('img[alt^="Cover The Punch"]');
+                        return img && img.complete && img.naturalWidth > 400;
+                    }""",
+                    timeout=45_000,
+                )
+            except Exception:
+                tag = page.evaluate(
+                    "(document.querySelector('%s') || {}).outerHTML || 'no cover tag found'"
+                    % COVER_SELECTOR
+                )
+                print(f"Cover never finished loading. Its tag looks like: {str(tag)[:600]}")
+                raise
+
+            cover = page.locator(COVER_SELECTOR).first
+            alt = cover.get_attribute("alt") or ""
+            source = cover.evaluate("img => img.currentSrc || img.src")
+            print(f"Cover found. Label: {alt!r}. Address: {source}")
+
+            today = datetime.now(NIGERIA).strftime("%d/%m/%Y")  # the label uses day/month/year
+            if "/" in alt and today not in alt:
+                raise ValueError(f"page still shows an older cover (label {alt!r}, today is {today})")
+
+            data = None
+            try:
+                response = context.request.get(source, headers={"Referer": COVER_PAGE_LINK})
+                print(f"Direct download: status {response.status}")
+                if response.ok:
+                    data = response.body()
+            except Exception as error:
+                print(f"Direct download failed: {error}")
+
+            if not data or len(data) < 20_000:
+                print("Using a screenshot of the cover instead.")
+                data = cover.screenshot(type="png")
+
+            return to_jpeg(data)
+        finally:
+            browser.close()
 
 
 def green_post(endpoint, **kwargs):
