@@ -1,9 +1,7 @@
 name: Send Daily Punch News
 
-
-
-
 on:
+  # Allows external trigger via GitHub API (cron-job.org) or manual execution
   workflow_dispatch:
 
 jobs:
