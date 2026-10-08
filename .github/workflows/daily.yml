@@ -4,10 +4,6 @@ name: Send Daily Punch News
 
 
 on:
-  schedule:
-    # Runs every day at 06:00 AM UTC
-    - cron: '37 6 * * *'
-  # Allows manual execution from the GitHub Actions tab
   workflow_dispatch:
 
 jobs:
