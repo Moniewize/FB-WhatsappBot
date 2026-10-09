@@ -6,6 +6,7 @@ import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from zoneinfo import ZoneInfo
 
 import requests
 from rapidfuzz import fuzz, process
@@ -19,14 +20,20 @@ PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
 DRY_RUN = os.getenv("DRY_RUN") == "1"  # prints the message instead of sending it
 
 PUNCH_OFFICIAL_RSS = "https://rss.punchng.com/v1/category/latest_news"
+NIGERIA = ZoneInfo("Africa/Lagos")
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
 }
-MATCH_THRESHOLD = 0.80  # share of a title's distinctive letters found on the cover
+
+MATCH_THRESHOLD = 0.80    # strong cover match
+PARTIAL_THRESHOLD = 0.50  # partial cover match (counts only inside the midnight batch)
 MAX_ITEMS = 10
+TITLE_LIMIT = 90
+WINDOW_HOURS_BEFORE_MIDNIGHT = 0  # batch starts at 12:00 the midnight 
+WINDOW_HOURS_AFTER_MIDNIGHT = 4   # batch ends at 04:00 today
 
 
 def parse_date(text):
@@ -39,17 +46,37 @@ def parse_date(text):
         return None
 
 
-def read_feed():
-    response = requests.get(PUNCH_OFFICIAL_RSS, headers=HEADERS, timeout=20)
+def fetch_feed_page(link):
+    response = requests.get(link, headers=HEADERS, timeout=20)
     response.raise_for_status()
     channel = ET.fromstring(response.content).find("channel")
     items = []
     for item in (channel.findall("item") if channel is not None else []):
         title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        if title and link:
-            items.append({"title": title, "link": link,
+        url = (item.findtext("link") or "").strip()
+        if title and url:
+            items.append({"title": title, "link": url,
                           "published": parse_date(item.findtext("pubDate"))})
+    return items
+
+
+def read_feed():
+    items, seen = [], set()
+    for page in range(1, 4):  # pages 2 and 3 are a guess; the log shows if they work
+        link = PUNCH_OFFICIAL_RSS if page == 1 else f"{PUNCH_OFFICIAL_RSS}?page={page}"
+        try:
+            batch = fetch_feed_page(link)
+        except Exception as error:
+            if page == 1:
+                raise
+            print(f"Feed page {page} not available ({error}).")
+            break
+        new = [i for i in batch if i["link"] not in seen]
+        seen.update(i["link"] for i in new)
+        items += new
+        print(f"Feed page {page}: {len(new)} new stories")
+        if not new:
+            break
     if not items:
         raise ValueError("news feed returned no items")
     return items
@@ -84,36 +111,100 @@ def coverage(title, cover_words):
     return matched / total
 
 
+def in_midnight_batch(item):
+    published = item["published"]
+    if not published:
+        return False
+    midnight = datetime.now(NIGERIA).replace(hour=0, minute=0, second=0, microsecond=0)
+    start = midnight - timedelta(hours=WINDOW_HOURS_BEFORE_MIDNIGHT)
+    end = midnight + timedelta(hours=WINDOW_HOURS_AFTER_MIDNIGHT)
+    return start <= published.astimezone(NIGERIA) <= end
+
+
+def when(item):
+    published = item["published"]
+    return published.astimezone(NIGERIA).strftime("%d %b %H:%M") if published else "unknown"
+
+
 def choose_items(feed, cover_pieces):
     cover_words = set(words_of(" ".join(cover_pieces)))
-    scored = sorted(((coverage(i["title"], cover_words), n, i) for n, i in enumerate(feed)),
-                    key=lambda row: (-row[0], row[1]))
-
-    print("\nBest-scoring feed stories (cover match, 1.00 = every word found):")
-    for score, _, item in scored[:15]:
-        print(f"  {score:.2f}  {item['title'][:90]}")
-
-    chosen = [i for score, _, i in scored if score >= MATCH_THRESHOLD][:MAX_ITEMS]
-    print(f"\nStories matched to the cover: {len(chosen)}")
-
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-    for item in feed:  # fill remaining slots with the newest stories
-        if len(chosen) >= MAX_ITEMS:
-            break
-        if item not in chosen and (item["published"] is None or item["published"] > cutoff):
-            chosen.append(item)
-    return chosen[:MAX_ITEMS]
+
+    rows = []
+    for position, item in enumerate(feed):
+        rows.append({
+            "item": item,
+            "position": position,
+            "score": coverage(item["title"], cover_words) if cover_words else 0.0,
+            "batch": in_midnight_batch(item),
+        })
+
+    def tier(row):
+        if row["score"] >= MATCH_THRESHOLD:
+            return 1
+        if row["batch"] and row["score"] >= PARTIAL_THRESHOLD:
+            return 2
+        if row["batch"]:
+            return 3
+        published = row["item"]["published"]
+        return 4 if (published is None or published > cutoff) else 9
+
+    in_batch = [r for r in rows if r["batch"]]
+    print(f"\nStories in the midnight batch: {len(in_batch)} of {len(rows)}")
+    print("Best cover matches (score | published Nigerian time | in batch | title):")
+    for row in sorted(rows, key=lambda r: -r["score"])[:15]:
+        print(f"  {row['score']:.2f} | {when(row['item'])} | "
+              f"{'yes' if row['batch'] else 'no '} | {row['item']['title'][:80]}")
+
+    ranked = sorted((r for r in rows if tier(r) < 9),
+                    key=lambda r: (tier(r), -r["score"], r["position"]))[:MAX_ITEMS]
+    print("\nChosen stories (tier | score | published | title):")
+    for row in ranked:
+        print(f"  {tier(row)} | {row['score']:.2f} | {when(row['item'])} | {row['item']['title'][:80]}")
+    return [row["item"] for row in ranked]
 
 
-def build_message(items):
-    lines = ["Today's Biggest Headlines\n\n"
-             "Here are some of the news reports that you shouldn't miss this morning:\n"]
-    for number, item in enumerate(items, 1):
-        lines.append(f"{number}. {item['title']} === {item['link']}")
-    footer = ("\n\n------------------------------\n"
-              "*Source:* The Punch\n"
-              "Brought by: RAC-FUTO Editorial Team")
-    return "\n\n".join(lines) + footer
+def shorten_title(title):
+    title = re.sub(r"\s*[-|–]\s*Punch.*$", "", title.strip(), flags=re.I)
+    if len(title) <= TITLE_LIMIT:
+        return title
+    cut = title[:TITLE_LIMIT].rsplit(" ", 1)[0].rstrip(",;:-– ")
+    return cut + "…"
+
+
+def tidy_links(items):
+    """Shorten each link with is.gd. If it fails, keep the original link."""
+    links = []
+    shortener_works = True
+    for item in items:
+        original = re.sub(r"[?&]utm_[^&]+", "", item["link"])
+        short = original
+        if shortener_works:
+            try:
+                response = requests.get("https://is.gd/create.php",
+                                        params={"format": "simple", "url": original},
+                                        headers=HEADERS, timeout=15)
+                text = response.text.strip()
+                if response.ok and text.startswith("http"):
+                    short = text
+                else:
+                    print(f"Link shortener refused ({response.status_code}): {text[:80]}")
+                    shortener_works = False
+            except Exception as error:
+                print(f"Link shortener failed: {error}")
+                shortener_works = False
+            time.sleep(1)
+        links.append(short)
+    return links
+
+
+def build_message(items, links):
+    today = datetime.now(NIGERIA).strftime("%A, %d %B %Y")
+    blocks = [f"*Today's Biggest Headlines*\n_{today}_\n\nStories you shouldn't miss this morning:"]
+    for number, (item, link) in enumerate(zip(items, links), 1):
+        blocks.append(f"*{number}.* {shorten_title(item['title'])}\n{link}")
+    blocks.append("_Source: The Punch · Brought by RAC-FUTO Editorial Team_")
+    return "\n\n".join(blocks)
 
 
 def green_post(endpoint, **kwargs):
@@ -155,8 +246,9 @@ def main():
     try:
         feed = read_feed()
         dates = [i["published"] for i in feed if i["published"]]
-        print(f"Feed stories: {len(feed)}. Oldest: {min(dates) if dates else 'unknown'}. "
-              f"Newest: {max(dates) if dates else 'unknown'}.")
+        print(f"Feed stories: {len(feed)}. Oldest: "
+              f"{min(dates).astimezone(NIGERIA) if dates else 'unknown'}. "
+              f"Newest: {max(dates).astimezone(NIGERIA) if dates else 'unknown'}.")
     except Exception as error:
         problems.append(f"headlines: {error}")
         feed = None
@@ -171,8 +263,9 @@ def main():
             print(f"Text pieces read from the cover: {len(cover_pieces)}")
             print("First 60:", cover_pieces[:60])
         except Exception as error:
-            print(f"Cover could not be read ({error}). Using the newest stories only.")
-        message = build_message(choose_items(feed, cover_pieces))
+            print(f"Cover could not be read ({error}). Relying on the midnight batch.")
+        chosen = choose_items(feed, cover_pieces)
+        message = build_message(chosen, tidy_links(chosen))
 
     print("\n===== MESSAGE =====\n" + message + "\n===================")
 
