@@ -110,7 +110,7 @@ def build_message(stories):
         lines.append(f"*{number}. {story['title']}*\n🔗 {story['link']}")
 
     footer = (
-        "\n------------------------------\n"
+        "\n\n"
         "*Source:* The Punch\n"
         " *Brought by:* RAC-FUTO Editorial Team"
     )
