@@ -48,8 +48,11 @@ def read_feed():
         title = (item.findtext("title") or "").strip()
         link = (item.findtext("link") or "").strip()
         if title and link:
-            items.append({"title": title, "link": link,
-                          "published": parse_date(item.findtext("pubDate"))})
+            items.append({
+                "title": title,
+                "link": link,
+                "published": parse_date(item.findtext("pubDate"))
+            })
     if not items:
         raise ValueError("news feed returned no items")
     return items
@@ -79,15 +82,18 @@ def coverage(title, cover_words):
     for word in words:
         total += len(word)
         if word in cover_words or process.extractOne(
-                word, cover_words, scorer=fuzz.ratio, score_cutoff=85):
+            word, cover_words, scorer=fuzz.ratio, score_cutoff=85
+        ):
             matched += len(word)
     return matched / total
 
 
 def choose_items(feed, cover_pieces):
     cover_words = set(words_of(" ".join(cover_pieces)))
-    scored = sorted(((coverage(i["title"], cover_words), n, i) for n, i in enumerate(feed)),
-                    key=lambda row: (-row[0], row[1]))
+    scored = sorted(
+        ((coverage(i["title"], cover_words), n, i) for n, i in enumerate(feed)),
+        key=lambda row: (-row[0], row[1])
+    )
 
     print("\nBest-scoring feed stories (cover match, 1.00 = every word found):")
     for score, _, item in scored[:15]:
@@ -106,13 +112,21 @@ def choose_items(feed, cover_pieces):
 
 
 def build_message(items):
-    lines = ["Today's Biggest Headlines\n\n"
-             "Here are some of the news reports that you shouldn't miss this morning:\n"]
+    lines = [
+        "*Today's Biggest Headlines*\n\n"
+        "Here are some of the news reports that you shouldn't miss this morning:\n"
+    ]
+    
     for number, item in enumerate(items, 1):
-        lines.append(f"{number}. {item['title']} === {item['link']}")
-    footer = ("\n\n \n"
-              "*Source:* The Punch\n"
-              "*Brought by*: RAC-FUTO Editorial Team")
+        # Format title cleanly and put the URL on its own line below it
+        lines.append(f"*{number}. {item['title']}*\n🔗 {item['link']}")
+
+    footer = (
+        "\n------------------------------\n"
+        "*Source:* The Punch\n"
+        " *Brought by:* RAC-FUTO Editorial Team"
+    )
+    
     return "\n\n".join(lines) + footer
 
 
@@ -144,9 +158,13 @@ def deliver(message):
 
 def main():
     if not DRY_RUN:
-        missing = [n for n, v in [("GREEN_API_ID_INSTANCE", ID_INSTANCE),
-                                  ("GREEN_API_TOKEN", API_TOKEN),
-                                  ("PHONE_NUMBER", PHONE_NUMBERS)] if not v]
+        missing = [
+            n for n, v in [
+                ("GREEN_API_ID_INSTANCE", ID_INSTANCE),
+                ("GREEN_API_TOKEN", API_TOKEN),
+                ("PHONE_NUMBER", PHONE_NUMBERS)
+            ] if not v
+        ]
         if missing:
             print(f"Missing environment variables: {', '.join(missing)}")
             sys.exit(1)
@@ -162,8 +180,10 @@ def main():
         feed = None
 
     if feed is None:
-        message = ("Daily Update Notice\n\nThere was a technical problem fetching "
-                   "this morning's headlines. We are looking into it.")
+        message = (
+            "Daily Update Notice\n\nThere was a technical problem fetching "
+            "this morning's headlines. We are looking into it."
+        )
     else:
         cover_pieces = []
         try:
@@ -182,7 +202,7 @@ def main():
         problems += deliver(message)
 
     if problems:
-        print("PROBLEMS:", *problems, sep="\n- ")
+        print("PROBLEMS:", *problems, sep="\n")
         sys.exit(1)
 
 
