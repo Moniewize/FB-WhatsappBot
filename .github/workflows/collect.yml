@@ -1,0 +1,31 @@
+name: Collect Punch Stories
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: collect-stories
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests
+      - run: python collect.py
+      - name: Save the collected stories
+        run: |
+          git config user.name "story-collector"
+          git config user.email "story-collector@users.noreply.github.com"
+          git add stories.json
+          git diff --cached --quiet || git commit -m "Update collected stories"
+          git pull --rebase --autostash
+          git push
