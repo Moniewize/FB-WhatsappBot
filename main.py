@@ -1,5 +1,6 @@
 import html
 import io
+import json
 import math
 import os
 import re
@@ -28,18 +29,27 @@ HEADERS = {
 }
 
 FEED_TIMES_ARE_LOCAL = True  # the feed prints Nigerian clock time but labels it +0000
-PRIORITY_START_HOUR = 0      # first choice: 00:00 ...
-PRIORITY_END_HOUR = 1        # ... to 01:00 today
-SECOND_END_HOUR = 4          # second choice: 01:00 to 04:00 today
+PRIORITY_START_HOUR = 0      # stories from 00:00 ...
+PRIORITY_END_HOUR = 1        # ... to 01:00 rank highest
+SECOND_END_HOUR = 4          # stories until 04:00 rank next
 MAX_ITEMS = 10
 LINK_MARK = "🔗"             # put "===" here if you prefer
 
 MIN_SCORE = 3.5              # how strong a cover match must be
 MIN_SHARED_WORDS = 2         # distinctive words a story must share with the cover
 TITLE_BOOST = 1.5            # headline words count more than summary words
-IGNORE_BOTTOM_SHARE = 0.20   # skip the bottom 20% of the cover (adverts)
-SMALL_TEXT_CUTOFF = 0.6      # skip text smaller than 60% of the typical size (captions)
+SMALL_TEXT_CUTOFF = 0.4      # skip text smaller than 40% of the typical size
+MIN_MATCHED = 3              # fewer cover matches than this and nothing is sent
 
+AD_SIGNS = ("www.", ".ng", ".com", "@", "licensed", "age 18", "play for", "bet on",
+            "download", "terms apply")
+SHORTHAND = {
+    "s'west": "south west", "s'east": "south east", "s'south": "south south",
+    "n'west": "north west", "n'east": "north east", "n'central": "north central",
+    "a'court": "appeal court", "s'court": "supreme court",
+    "n'assembly": "national assembly", "fg": "federal government",
+    "naf": "nigerian air force",
+}
 NOISE_WORDS = {
     "punch", "punchng", "newspaper", "newspapers", "widely", "read", "most", "year",
     "mobilepunch", "punchnewspapers", "page", "pages", "friday", "saturday", "sunday",
@@ -49,7 +59,7 @@ NOISE_WORDS = {
     "which", "also", "more", "than", "here", "there", "your", "just", "would", "could",
     "should", "still", "only", "some", "other",
 }
-TOKEN = re.compile(r"[a-z]{4,}|\d[\d,]*\d")
+TOKEN = re.compile(r"n\d[\d.,]*(?:bn|trn|m|b|k)?|[a-z]{4,}|\d[\d,]*\d")
 
 
 def clean(text):
@@ -88,51 +98,90 @@ def read_feed():
     return stories
 
 
+def merge_collected(feed):
+    """Adds stories saved overnight by the optional collector (stories.json), if present."""
+    try:
+        with open("stories.json", encoding="utf-8") as handle:
+            saved = json.load(handle)
+    except Exception as error:
+        print(f"No saved stories used ({error}).")
+        return feed
+    seen = {s["link"] for s in feed}
+    added = 0
+    for row in saved:
+        if row["link"] in seen:
+            continue
+        try:
+            published = datetime.fromisoformat(row["published"])
+        except Exception:
+            continue
+        feed.append({"title": row["title"], "link": row["link"], "guid": row.get("guid", ""),
+                     "summary": row.get("summary", ""), "raw_date": row["published"],
+                     "published": published})
+        seen.add(row["link"])
+        added += 1
+    print(f"Saved stories added: {added} (saved file holds {len(saved)}).")
+    return feed
+
+
+def expand(text):
+    text = text.lower().replace("’", "'")
+    for short, full in SHORTHAND.items():
+        text = re.sub(rf"\b{re.escape(short)}\b", full, text)
+    return text
+
+
 def words_in(text):
     found = []
-    for token in TOKEN.findall(text.lower()):
-        token = token.replace(",", "")
+    for token in TOKEN.findall(expand(text)):
+        token = token.replace(",", "").rstrip(".")
         if token not in NOISE_WORDS and (token.isalpha() or len(token) >= 3):
             found.append(token)
     return found
 
 
 def read_cover_lines():
-    """Reads the cover and returns its headline-sized text lines, top to bottom."""
-    from PIL import Image
+    """Reads the cover twice (normal and colour-inverted) and returns its text lines."""
+    from PIL import Image, ImageOps
     from rapidocr import RapidOCR
     from cover import fetch_cover
 
-    image_bytes = fetch_cover()
-    page_height = Image.open(io.BytesIO(image_bytes)).height
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as handle:
-        handle.write(image_bytes)
-        path = handle.name
-    try:
-        result = RapidOCR()(path)
-    finally:
-        os.remove(path)
-    if result is None or result.txts is None or result.boxes is None:
-        return []
+    picture = Image.open(io.BytesIO(fetch_cover())).convert("RGB")
+    engine = RapidOCR()
 
-    found = []
-    for box, text, score in zip(result.boxes, result.txts, result.scores):
-        text = text.strip()
-        if score < 0.5 or not text:
+    found, seen_text = [], set()
+    for name, version in (("normal", picture), ("inverted", ImageOps.invert(picture))):
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as handle:
+            version.save(handle, "JPEG", quality=92)
+            path = handle.name
+        try:
+            result = engine(path)
+        finally:
+            os.remove(path)
+        if result is None or result.txts is None or result.boxes is None:
             continue
-        ys = [float(p[1]) for p in box]
-        xs = [float(p[0]) for p in box]
-        found.append({"y": min(ys), "x": min(xs), "h": max(ys) - min(ys), "text": text})
+        added = 0
+        for box, text, score in zip(result.boxes, result.txts, result.scores):
+            text = text.strip()
+            key = re.sub(r"[^a-z0-9]", "", text.lower())
+            if score < 0.5 or len(key) < 3 or key in seen_text:
+                continue
+            seen_text.add(key)
+            ys = [float(p[1]) for p in box]
+            xs = [float(p[0]) for p in box]
+            found.append({"y": min(ys), "x": min(xs), "h": max(ys) - min(ys), "text": text})
+            added += 1
+        print(f"Cover reading pass '{name}': {added} new text pieces.")
     if not found:
         return []
 
     median = sorted(f["h"] for f in found)[len(found) // 2]
     keep = [f for f in found
             if f["h"] >= SMALL_TEXT_CUTOFF * median
-            and f["y"] <= page_height * (1 - IGNORE_BOTTOM_SHARE)]
+            and not any(sign in f["text"].lower() for sign in AD_SIGNS)]
     keep.sort(key=lambda f: (f["y"], f["x"]))
     print(f"Cover text pieces read: {len(found)}. Kept {len(keep)} "
-          f"(small print and the bottom {int(IGNORE_BOTTOM_SHARE * 100)}% ignored).")
+          f"(small print and advert lines dropped).")
     return [f["text"] for f in keep]
 
 
@@ -208,22 +257,11 @@ def pick_stories(feed):
     second_end = midnight + timedelta(hours=SECOND_END_HOUR)
 
     dated = [s for s in feed if s["published"]]
-    print(f"Nigerian time now: {now:%d %b %H:%M}. Raw dates, first and last: "
-          f"{feed[0]['raw_date']} | {feed[-1]['raw_date']}")
-    print(f"Sample address field from the feed: {feed[0]['guid']}")
+    print(f"Nigerian time now: {now:%d %b %H:%M}. Sample address field: {feed[0]['guid']}")
     if dated:
-        print(f"Feed covers {min(s['published'] for s in dated):%d %b %H:%M} to "
+        print(f"Stories available (feed plus saved) cover "
+              f"{min(s['published'] for s in dated):%d %b %H:%M} to "
               f"{max(s['published'] for s in dated):%d %b %H:%M} ({len(feed)} stories).")
-
-    tier1 = sorted((s for s in dated if first_start <= s["published"] < first_end),
-                   key=lambda s: s["published"])
-    tier2 = sorted((s for s in dated if first_end <= s["published"] <= second_end),
-                   key=lambda s: s["published"])
-    cutoff = now - timedelta(hours=24)
-    tier3 = sorted((s for s in dated if s["published"] > cutoff),
-                   key=lambda s: s["published"], reverse=True)
-    print(f"Priority hour ({first_start:%H:%M} to {first_end:%H:%M}): {len(tier1)} stories. "
-          f"Then until {second_end:%H:%M}: {len(tier2)} stories.")
 
     def bonus(story):
         published = story["published"]
@@ -242,15 +280,9 @@ def pick_stories(feed):
         print(f"Cover matching skipped: {error}")
     print(f"Stories matched to the cover: {len(matched)}")
 
-    chosen, seen = [], set()
-    for tier in (matched, tier1, tier2, tier3):
-        for story in tier:
-            if story["link"] not in seen and len(chosen) < MAX_ITEMS:
-                seen.add(story["link"])
-                chosen.append(story)
-    if not chosen:
-        raise ValueError("no usable stories in the feed")
-    return chosen
+    if not matched or len(matched) < MIN_MATCHED:
+        raise ValueError(f"only {len(matched)} stories matched the cover; nothing sent")
+    return matched[:MAX_ITEMS]
 
 
 def shorten_with(endpoint, extra, original):
@@ -267,25 +299,20 @@ def shorten_with(endpoint, extra, original):
 
 
 def tidy_links(stories):
-    shorteners = [("is.gd", "https://is.gd/create.php", {"format": "simple"}),
-                  ("TinyURL", "https://tinyurl.com/api-create.php", {})]
-    working = {name: True for name, _, _ in shorteners}
+    working = True
     links, methods = [], {}
     for story in stories:
         original = re.sub(r"[?&]utm_[^&]+", "", story["link"])
         short, method = original, "full link"
         if re.fullmatch(r"https?://(?:www\.)?punchng\.com/\?p=\d+", story["guid"]):
             short, method = story["guid"], "Punch short address"
-        else:
-            for name, endpoint, extra in shorteners:
-                if not working[name]:
-                    continue
-                result = shorten_with(endpoint, extra, original)
-                if result:
-                    short, method = result, name
-                    time.sleep(1)
-                    break
-                working[name] = False
+        elif working:
+            result = shorten_with("https://is.gd/create.php", {"format": "simple"}, original)
+            if result:
+                short, method = result, "is.gd"
+                time.sleep(1)
+            else:
+                working = False
         methods[method] = methods.get(method, 0) + 1
         links.append(short)
     print("Link methods used:", methods)
@@ -347,12 +374,11 @@ def main():
 
     problems = []
     try:
-        stories = pick_stories(read_feed())
+        stories = pick_stories(merge_collected(read_feed()))
         message = build_message(stories, tidy_links(stories))
     except Exception as error:
-        problems.append(f"headlines: {error}")
-        message = ("Daily Update Notice\n\nThere was a technical problem fetching "
-                   "this morning's headlines. We are looking into it.")
+        print(f"NOT SENT: {error}")
+        sys.exit(1)  # the team gets nothing; GitHub emails you instead
 
     print("\n===== MESSAGE =====\n" + message + "\n===================")
 
