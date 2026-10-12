@@ -16,8 +16,6 @@ import requests
 ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
-
-# Telegram Environment Variables
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -39,8 +37,10 @@ MIN_WORDS = 3                # a title needs at least this many distinctive word
 MIN_MATCHED = 1              # fewer cover matches than this and nothing is sent
 SMALL_TEXT_CUTOFF = 0.4      # ignore cover text smaller than 40% of the typical size
 LINK_MARK = "==="            # shown before each link
+COVER_ATTEMPTS = 6           # tries to get the cover ...
+COVER_WAIT_SECONDS = 120     # ... with this pause between tries (about 12 minutes in total)
 
-ROUNDUP = re.compile(r"recap|top stories|roundup|headlines|newspaper review", re.I)
+ROUNDUP = re.compile(r"\b(recap|top stories|roundup|headlines|newspaper review)\b", re.I)
 AD_SIGNS = ("www.", ".ng", ".com", "@", "licensed", "age 18", "play for", "bet on",
             "download", "terms apply")
 SHORTHAND = {
@@ -135,13 +135,26 @@ def words_in(text):
     return found
 
 
-def read_cover_lines():
+def get_cover():
+    """Downloads today's cover, trying again for a while if it is not online yet."""
+    from cover import fetch_cover
+
+    for attempt in range(1, COVER_ATTEMPTS + 1):
+        try:
+            return fetch_cover()
+        except Exception as error:
+            print(f"Cover not ready (attempt {attempt} of {COVER_ATTEMPTS}): {error}")
+            if attempt < COVER_ATTEMPTS:
+                time.sleep(COVER_WAIT_SECONDS)
+    return None
+
+
+def read_cover_lines(image_bytes):
     """Reads the cover twice (normal and colour-inverted) and returns its text lines."""
     from PIL import Image, ImageOps
     from rapidocr import RapidOCR
-    from cover import fetch_cover
 
-    picture = Image.open(io.BytesIO(fetch_cover())).convert("RGB")
+    picture = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     engine = RapidOCR()
 
     found, seen_text = [], set()
@@ -228,10 +241,14 @@ def pick_stories(feed):
               f"{max(s['published'] for s in dated):%d %b %H:%M} ({len(feed)} stories).")
 
     matched = []
-    try:
-        matched = match_cover(feed, read_cover_lines())
-    except Exception as error:
-        print(f"Cover matching failed: {error}")
+    cover = get_cover()
+    if cover is None:
+        print("The cover never became available.")
+    else:
+        try:
+            matched = match_cover(feed, read_cover_lines(cover))
+        except Exception as error:
+            print(f"Cover matching failed: {error}")
     print(f"\nStories matched to the cover: {len(matched)}")
     if len(matched) < MIN_MATCHED:
         raise ValueError(f"only {len(matched)} stories matched the cover; nothing sent")
@@ -294,8 +311,8 @@ def build_message(stories, links):
         "Here are some of the news reports that you shouldn't miss this morning:\n"
     ]
     for number, (story, link) in enumerate(zip(stories, links), 1):
-        # Sanitized to prevent markdown crash in chat apps
-        safe_title = story['title'].replace('*', '').replace('_', '').replace('`', '')
+        # characters that break bold text or links in chat apps are removed
+        safe_title = re.sub(r"[*_`\[\]]", "", story["title"])
         lines.append(f"*{number}. {safe_title}*\n{LINK_MARK} {link}")
 
     footer = (
@@ -318,71 +335,82 @@ def chat_identifier(raw):
     return cleaned if ("@g.us" in cleaned or "@c.us" in cleaned) else f"{cleaned}@c.us"
 
 
+def whatsapp_ready():
+    return bool(ID_INSTANCE and API_TOKEN and PHONE_NUMBERS)
+
+
+def telegram_ready():
+    return bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
+
+
 def deliver_whatsapp(message):
-    failures = []
-    if not PHONE_NUMBERS or not ID_INSTANCE or not API_TOKEN:
-        return ["WhatsApp credentials missing"]
+    """Returns (messages_sent, problems)."""
+    if not whatsapp_ready():
+        print("WhatsApp skipped: credentials not set.")
+        return 0, []
+    sent, problems = 0, []
     for raw in (p for p in PHONE_NUMBERS.split(",") if p.strip()):
         chat = chat_identifier(raw)
         try:
             green_post("sendMessage", json={"chatId": chat, "message": message})
+            sent += 1
             print(f"Headlines delivered via WhatsApp to {chat}")
         except Exception as error:
-            failures.append(f"WhatsApp {chat}: {error}")
+            problems.append(f"WhatsApp {chat}: {error}")
             print(f"FAILED for WhatsApp {chat}: {error}")
         time.sleep(3)
-    return failures
+    return sent, problems
 
 
 def deliver_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Skipping Telegram: Missing token or chat ID.")
-        return ["Telegram credentials missing"]
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": False
-        }
-        response = requests.post(url, json=payload, timeout=20)
-        response.raise_for_status()
-        print("✅ Headlines successfully delivered to Telegram!")
-        return []
-    except Exception as error:
-        print(f"❌ Telegram delivery failed: {error}")
-        return [f"Telegram: {error}"]
+    """Returns (messages_sent, problems)."""
+    if not telegram_ready():
+        print("Telegram skipped: credentials not set.")
+        return 0, []
+    link = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    base = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    for extra in ({"parse_mode": "Markdown"}, {}):  # plain text if Markdown is rejected
+        try:
+            response = requests.post(link, json={**base, **extra}, timeout=30)
+            if response.status_code == 400 and extra:
+                print(f"Telegram rejected the formatting ({response.text[:120]}). "
+                      "Retrying as plain text.")
+                continue
+            response.raise_for_status()
+            print("Headlines delivered to Telegram.")
+            return 1, []
+        except Exception as error:
+            print(f"Telegram delivery failed: {error}")
+            return 0, [f"Telegram: {error}"]
+    return 0, ["Telegram: delivery failed"]
 
 
 def main():
-    missing = [name for name, value in [
-        ("GREEN_API_ID_INSTANCE", ID_INSTANCE),
-        ("GREEN_API_TOKEN", API_TOKEN),
-        ("PHONE_NUMBER", PHONE_NUMBERS),
-    ] if not value]
-    
-    if missing:
-        print(f"Warning: Missing WhatsApp environment variables: {', '.join(missing)}")
+    if not (whatsapp_ready() or telegram_ready()):
+        print("No delivery channel is configured (WhatsApp or Telegram secrets missing).")
+        sys.exit(1)
 
     try:
         stories = pick_stories(merge_collected(read_feed()))
         message = build_message(stories, tidy_links(stories))
     except Exception as error:
         print(f"NOT SENT: {error}")
-        sys.exit(1)
+        sys.exit(1)  # the team gets nothing; GitHub emails you instead
 
     print("\n===== MESSAGE =====\n" + message + "\n===================")
-    
-    # Dispatch concurrently to both channels
-    wa_problems = deliver_whatsapp(message) if ID_INSTANCE and PHONE_NUMBERS else []
-    tg_problems = deliver_telegram(message) if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID else []
-    
-    all_problems = wa_problems + tg_problems
-    if all_problems and len(all_problems) == (len(PHONE_NUMBERS.split(",")) if PHONE_NUMBERS else 0) + 1:
-        # If everything completely failed
-        print("PROBLEMS:", *all_problems, sep="\n")
+
+    delivered, problems = 0, []
+    for deliver in (deliver_whatsapp, deliver_telegram):
+        sent, issues = deliver(message)
+        delivered += sent
+        problems += issues
+
+    if delivered == 0:
+        print("NOT DELIVERED: no channel accepted the message.")
         sys.exit(1)
+    if problems:
+        print("PROBLEMS (the message reached some recipients):", *problems, sep="\n- ")
+        sys.exit(1)  # marks the run as failed so GitHub emails you
 
 
 if __name__ == "__main__":
