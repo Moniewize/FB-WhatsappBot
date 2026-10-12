@@ -14,6 +14,9 @@ ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 COVER_PAGE_LINK = "https://www.frontpages.com/the-punch/"
 COVER_SELECTOR = 'img[alt^="Cover The Punch"]'
 NIGERIA = ZoneInfo("Africa/Lagos")
@@ -118,7 +121,7 @@ def chat_identifier(raw):
     return cleaned if ("@g.us" in cleaned or "@c.us" in cleaned) else f"{cleaned}@c.us"
 
 
-def deliver(image):
+def deliver_whatsapp(image):
     failures = []
     today = datetime.now(NIGERIA).strftime("%A, %d %B %Y")
     for raw in (p for p in PHONE_NUMBERS.split(",") if p.strip()):
@@ -126,16 +129,45 @@ def deliver(image):
         try:
             green_post(
                 "sendFileByUpload",
-                data={"chatId": chat, "fileName": "punch_frontpage.jpg",
-                      "caption": f"The Punch front page, {today}"},
+                data={
+                    "chatId": chat,
+                    "fileName": "punch_frontpage.jpg",
+                    "caption": f"The Punch front page, {today}",
+                },
                 files={"file": ("punch_frontpage.jpg", image, "image/jpeg")},
             )
-            print(f"Cover delivered to {chat}")
+            print(f"Cover delivered to WhatsApp chat {chat}")
         except Exception as error:
-            failures.append(f"{chat}: {error}")
-            print(f"FAILED for {chat}: {error}")
+            failures.append(f"WhatsApp {chat}: {error}")
+            print(f"FAILED for WhatsApp {chat}: {error}")
         time.sleep(3)
     return failures
+
+
+def deliver_telegram(image):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram credentials not fully set; skipping Telegram delivery.")
+        return []
+    
+    today = datetime.now(NIGERIA).strftime("%A, %d %B %Y")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    
+    try:
+        response = requests.post(
+            url,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "caption": f"The Punch front page, {today}"
+            },
+            files={"photo": ("punch_frontpage.jpg", image, "image/jpeg")},
+            timeout=60
+        )
+        response.raise_for_status()
+        print("Cover successfully delivered to Telegram!")
+        return []
+    except Exception as error:
+        print(f"FAILED for Telegram: {error}")
+        return [f"Telegram: {error}"]
 
 
 def main():
@@ -152,11 +184,14 @@ def main():
         image = fetch_cover()
     except Exception as error:
         print(f"No cover sent: {error}")
-        sys.exit(1)  # nothing goes to your team; GitHub emails you instead
+        sys.exit(1)
 
-    problems = deliver(image)
+    whatsapp_problems = deliver_whatsapp(image)
+    telegram_problems = deliver_telegram(image)
+    
+    problems = whatsapp_problems + telegram_problems
     if problems:
-        print("PROBLEMS:", *problems, sep="\n- ")
+        print("PROBLEMS:", *problems, sep="\n")
         sys.exit(1)
 
 
