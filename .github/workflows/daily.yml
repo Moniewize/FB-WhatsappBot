@@ -1,8 +1,9 @@
 name: Send Daily Punch News
 
 on:
-  # Allows external trigger via GitHub API (cron-job.org) or manual execution
-  workflow_dispatch:
+  repository_dispatch:
+    types: [trigger-news-bot]
+  workflow_dispatch: # Keeps manual execution working too
 
 jobs:
   run-news-bot:
@@ -28,5 +29,7 @@ jobs:
           GREEN_API_TOKEN: ${{ secrets.GREEN_API_TOKEN }}
           PHONE_NUMBER: ${{ secrets.PHONE_NUMBER }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py
