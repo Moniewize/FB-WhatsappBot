@@ -14,6 +14,22 @@ ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
 
+# Optional: the hosts shown as "apiUrl" and "mediaUrl" in your Green API console
+GREEN_API_URL = (os.getenv("GREEN_API_URL") or "").strip().rstrip("/")
+GREEN_MEDIA_URL = (os.getenv("GREEN_MEDIA_URL") or "").strip().rstrip("/")
+API_HOSTS = [h for h in dict.fromkeys([
+    GREEN_API_URL,
+    "https://api.greenapi.com",    # Green API's universal host
+    "https://api.green-api.com",   # the old host
+]) if h]
+MEDIA_HOSTS = [h for h in dict.fromkeys([
+    GREEN_MEDIA_URL,
+    "https://media.greenapi.com",  # universal media host (file uploads)
+    "https://media.green-api.com",
+    *API_HOSTS,                    # these accepted uploads for you before
+]) if h]
+GREEN_STATE = {"down": False}      # set once every host proved unreachable
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -24,6 +40,17 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+COVER_ATTEMPTS = 6        # tries to get the cover ...
+COVER_WAIT_SECONDS = 120  # ... with this pause between tries (about 12 minutes in total)
+
+
+def safe(text):
+    """Hides secret tokens in anything that is printed."""
+    text = str(text)
+    for secret in (API_TOKEN, TELEGRAM_BOT_TOKEN):
+        if secret:
+            text = text.replace(secret, "***")
+    return text
 
 
 def launch_browser(playwright):
@@ -109,11 +136,50 @@ def fetch_cover():
             browser.close()
 
 
+def get_cover():
+    """Downloads today's cover, trying again for a while if it is not online yet."""
+    for attempt in range(1, COVER_ATTEMPTS + 1):
+        try:
+            return fetch_cover()
+        except Exception as error:
+            print(f"Cover not ready (attempt {attempt} of {COVER_ATTEMPTS}): {error}")
+            if attempt < COVER_ATTEMPTS:
+                time.sleep(COVER_WAIT_SECONDS)
+    return None
+
+
 def green_post(endpoint, **kwargs):
-    link = f"https://api.green-api.com/waInstance{ID_INSTANCE}/{endpoint}/{API_TOKEN}"
-    response = requests.post(link, timeout=60, **kwargs)
-    response.raise_for_status()
-    return response.json()
+    """Sends a request to Green API, trying each host. Moves on only if nothing was processed."""
+    if GREEN_STATE["down"]:
+        raise ConnectionError("Green API was unreachable earlier in this run")
+    hosts = MEDIA_HOSTS if endpoint in ("sendFileByUpload", "uploadFile") else API_HOSTS
+    last_error = None
+    for round_number in range(2):
+        for host in list(hosts):
+            name = host.split("//")[1]
+            link = f"{host}/waInstance{ID_INSTANCE}/{endpoint}/{API_TOKEN}"
+            try:
+                response = requests.post(link, timeout=(10, 90), **kwargs)
+            except requests.ConnectionError as error:  # no connection: nothing was sent
+                last_error = error
+                print(f"Green API host not reachable: {name}")
+                continue
+            if response.status_code in (401, 403, 404) and host != hosts[-1]:
+                last_error = requests.HTTPError(f"{response.status_code} from {name}")
+                print(f"{name} refused this instance ({response.status_code}). Trying the next host.")
+                continue
+            response.raise_for_status()
+            print(f"Green API host used: {name}")
+            if host != hosts[0]:  # try the host that worked first next time
+                hosts.remove(host)
+                hosts.insert(0, host)
+            return response.json()
+        if round_number == 0:
+            print("No Green API host reachable. Waiting 20 seconds, then trying again.")
+            time.sleep(20)
+    if isinstance(last_error, requests.ConnectionError):
+        GREEN_STATE["down"] = True
+    raise last_error
 
 
 def chat_identifier(raw):
@@ -121,8 +187,20 @@ def chat_identifier(raw):
     return cleaned if ("@g.us" in cleaned or "@c.us" in cleaned) else f"{cleaned}@c.us"
 
 
+def whatsapp_ready():
+    return bool(ID_INSTANCE and API_TOKEN and PHONE_NUMBERS)
+
+
+def telegram_ready():
+    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
+
 def deliver_whatsapp(image):
-    failures = []
+    """Returns (photos_sent, problems)."""
+    if not whatsapp_ready():
+        print("WhatsApp skipped: credentials not set.")
+        return 0, []
+    sent, problems = 0, []
     today = datetime.now(NIGERIA).strftime("%A, %d %B %Y")
     for raw in (p for p in PHONE_NUMBERS.split(",") if p.strip()):
         chat = chat_identifier(raw)
@@ -136,63 +214,69 @@ def deliver_whatsapp(image):
                 },
                 files={"file": ("punch_frontpage.jpg", image, "image/jpeg")},
             )
+            sent += 1
             print(f"Cover delivered to WhatsApp chat {chat}")
         except Exception as error:
-            failures.append(f"WhatsApp {chat}: {error}")
-            print(f"FAILED for WhatsApp {chat}: {error}")
+            problems.append(f"WhatsApp {chat}: {safe(error)}")
+            print(f"FAILED for WhatsApp {chat}: {safe(error)}")
         time.sleep(3)
-    return failures
+    return sent, problems
 
 
 def deliver_telegram(image):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram credentials not fully set; skipping Telegram delivery.")
-        return []
-    
+    """Returns (photos_sent, problems)."""
+    if not telegram_ready():
+        print("Telegram skipped: credentials not set.")
+        return 0, []
+
     today = datetime.now(NIGERIA).strftime("%A, %d %B %Y")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    
-    try:
-        response = requests.post(
-            url,
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "caption": f"The Punch front page, {today}"
-            },
-            files={"photo": ("punch_frontpage.jpg", image, "image/jpeg")},
-            timeout=60
-        )
-        response.raise_for_status()
-        print("Cover successfully delivered to Telegram!")
-        return []
-    except Exception as error:
-        print(f"FAILED for Telegram: {error}")
-        return [f"Telegram: {error}"]
+    for attempt in range(1, 3):
+        try:
+            response = requests.post(
+                url,
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": f"The Punch front page, {today}"},
+                files={"photo": ("punch_frontpage.jpg", image, "image/jpeg")},
+                timeout=(10, 60),
+            )
+        except requests.ConnectionError as error:  # no connection: nothing was sent
+            print(f"Telegram not reachable (attempt {attempt} of 2): {safe(error)}")
+            time.sleep(10)
+            continue
+        except Exception as error:
+            print(f"Telegram delivery failed: {safe(error)}")
+            return 0, [f"Telegram: {safe(error)}"]
+        if not response.ok:
+            reason = response.text[:300]
+            print(f"Telegram refused ({response.status_code}): {reason}")
+            return 0, [f"Telegram {response.status_code}: {reason}"]
+        print("Cover delivered to Telegram.")
+        return 1, []
+    return 0, ["Telegram: not reachable"]
 
 
 def main():
-    missing = [name for name, value in [
-        ("GREEN_API_ID_INSTANCE", ID_INSTANCE),
-        ("GREEN_API_TOKEN", API_TOKEN),
-        ("PHONE_NUMBER", PHONE_NUMBERS),
-    ] if not value]
-    if missing:
-        print(f"Missing environment variables: {', '.join(missing)}")
+    if not (whatsapp_ready() or telegram_ready()):
+        print("No delivery channel is configured (WhatsApp or Telegram secrets missing).")
         sys.exit(1)
 
-    try:
-        image = fetch_cover()
-    except Exception as error:
-        print(f"No cover sent: {error}")
+    image = get_cover()
+    if image is None:
+        print("No cover sent: it never became available.")
         sys.exit(1)
 
-    whatsapp_problems = deliver_whatsapp(image)
-    telegram_problems = deliver_telegram(image)
-    
-    problems = whatsapp_problems + telegram_problems
+    delivered, problems = 0, []
+    for deliver in (deliver_whatsapp, deliver_telegram):
+        sent, issues = deliver(image)
+        delivered += sent
+        problems += issues
+
+    if delivered == 0:
+        print("NOT DELIVERED: no channel accepted the cover.")
+        sys.exit(1)
     if problems:
-        print("PROBLEMS:", *problems, sep="\n")
-        sys.exit(1)
+        print("PROBLEMS (the cover reached some recipients):", *problems, sep="\n- ")
+        sys.exit(1)  # marks the run as failed so GitHub emails you
 
 
 if __name__ == "__main__":
