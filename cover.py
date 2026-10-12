@@ -29,6 +29,8 @@ MEDIA_HOSTS = [h for h in dict.fromkeys([
     *API_HOSTS,                    # these accepted uploads for you before
 ]) if h]
 GREEN_STATE = {"down": False}      # set once every host proved unreachable
+SEND_ATTEMPTS = 2                  # tries per recipient
+JOURNAL_WAIT_SECONDS = 120         # Green API's journal can lag by up to 2 minutes
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -42,6 +44,15 @@ USER_AGENT = (
 )
 COVER_ATTEMPTS = 6        # tries to get the cover ...
 COVER_WAIT_SECONDS = 120  # ... with this pause between tries (about 12 minutes in total)
+
+
+class GreenAmbiguous(Exception):
+    """Green API answered with a server error or timed out after connecting.
+    The message may or may not have been accepted."""
+
+    def __init__(self, host, message):
+        super().__init__(message)
+        self.host = host
 
 
 def safe(text):
@@ -148,11 +159,17 @@ def get_cover():
     return None
 
 
-def green_post(endpoint, **kwargs):
-    """Sends a request to Green API, trying each host. Moves on only if nothing was processed."""
+def green_post(endpoint, skip_hosts=(), **kwargs):
+    """Sends a request to Green API, trying each host.
+    Moves on only when no connection was made. A server error or a timeout after
+    connecting raises GreenAmbiguous, because the message may already be accepted."""
     if GREEN_STATE["down"]:
         raise ConnectionError("Green API was unreachable earlier in this run")
-    hosts = MEDIA_HOSTS if endpoint in ("sendFileByUpload", "uploadFile") else API_HOSTS
+    pool = MEDIA_HOSTS if endpoint in ("sendFileByUpload", "uploadFile") else API_HOSTS
+    hosts = [h for h in pool if h not in skip_hosts]
+    if not hosts:
+        raise ConnectionError("no Green API host left to try")
+
     last_error = None
     for round_number in range(2):
         for host in list(hosts):
@@ -164,15 +181,19 @@ def green_post(endpoint, **kwargs):
                 last_error = error
                 print(f"Green API host not reachable: {name}")
                 continue
+            except requests.Timeout as error:  # connected, then no answer in time
+                raise GreenAmbiguous(host, f"no answer from {name}") from error
+            if response.status_code in (502, 503, 504):
+                raise GreenAmbiguous(host, f"{response.status_code} from {name}")
             if response.status_code in (401, 403, 404) and host != hosts[-1]:
                 last_error = requests.HTTPError(f"{response.status_code} from {name}")
                 print(f"{name} refused this instance ({response.status_code}). Trying the next host.")
                 continue
             response.raise_for_status()
             print(f"Green API host used: {name}")
-            if host != hosts[0]:  # try the host that worked first next time
-                hosts.remove(host)
-                hosts.insert(0, host)
+            if host != pool[0]:  # try the host that worked first next time
+                pool.remove(host)
+                pool.insert(0, host)
             return response.json()
         if round_number == 0:
             print("No Green API host reachable. Waiting 20 seconds, then trying again.")
@@ -180,6 +201,49 @@ def green_post(endpoint, **kwargs):
     if isinstance(last_error, requests.ConnectionError):
         GREEN_STATE["down"] = True
     raise last_error
+
+
+def already_sent(chat, caption):
+    """Asks Green API's message journal whether this chat already got the cover."""
+    for host in API_HOSTS:
+        link = f"{host}/waInstance{ID_INSTANCE}/lastOutgoingMessages/{API_TOKEN}"
+        try:
+            response = requests.get(link, params={"minutes": 15}, timeout=(10, 30))
+            if not response.ok:
+                continue
+            rows = response.json()
+        except (requests.RequestException, ValueError):
+            continue
+        return any(
+            isinstance(row, dict)
+            and row.get("chatId") == chat
+            and (row.get("caption") or "").strip() == caption.strip()
+            and row.get("statusMessage") != "failed"
+            for row in rows
+        )
+    return False
+
+
+def send_cover(chat, image, caption):
+    """Sends the cover to one chat without risking a duplicate after a gateway timeout."""
+    data = {"chatId": chat, "fileName": "punch_frontpage.jpg", "caption": caption}
+    files = {"file": ("punch_frontpage.jpg", image, "image/jpeg")}
+    skip = set()
+    for attempt in range(1, SEND_ATTEMPTS + 1):
+        try:
+            green_post("sendFileByUpload", skip_hosts=skip, data=data, files=files)
+            return
+        except GreenAmbiguous as error:
+            print(f"Green API gave no clear answer ({error}). Waiting "
+                  f"{JOURNAL_WAIT_SECONDS} seconds, then checking whether it was sent anyway.")
+            skip.add(error.host)
+            time.sleep(JOURNAL_WAIT_SECONDS)
+            if already_sent(chat, caption):
+                print("The message journal shows the cover was delivered after all.")
+                return
+            if attempt == SEND_ATTEMPTS:
+                raise
+            print("Not in the journal. Trying the next host.")
 
 
 def chat_identifier(raw):
@@ -201,19 +265,11 @@ def deliver_whatsapp(image):
         print("WhatsApp skipped: credentials not set.")
         return 0, []
     sent, problems = 0, []
-    today = datetime.now(NIGERIA).strftime("%A, %d %B %Y")
+    caption = f"The Punch front page, {datetime.now(NIGERIA).strftime('%A, %d %B %Y')}"
     for raw in (p for p in PHONE_NUMBERS.split(",") if p.strip()):
         chat = chat_identifier(raw)
         try:
-            green_post(
-                "sendFileByUpload",
-                data={
-                    "chatId": chat,
-                    "fileName": "punch_frontpage.jpg",
-                    "caption": f"The Punch front page, {today}",
-                },
-                files={"file": ("punch_frontpage.jpg", image, "image/jpeg")},
-            )
+            send_cover(chat, image, caption)
             sent += 1
             print(f"Cover delivered to WhatsApp chat {chat}")
         except Exception as error:
