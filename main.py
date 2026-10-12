@@ -17,6 +17,10 @@ ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
 
+# Telegram Environment Variables
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 PUNCH_OFFICIAL_RSS = "https://rss.punchng.com/v1/category/latest_news"
 NIGERIA = ZoneInfo("Africa/Lagos")
 HEADERS = {
@@ -290,7 +294,9 @@ def build_message(stories, links):
         "Here are some of the news reports that you shouldn't miss this morning:\n"
     ]
     for number, (story, link) in enumerate(zip(stories, links), 1):
-        lines.append(f"*{number}. {story['title']}*\n{LINK_MARK} {link}")
+        # Sanitized to prevent markdown crash in chat apps
+        safe_title = story['title'].replace('*', '').replace('_', '').replace('`', '')
+        lines.append(f"*{number}. {safe_title}*\n{LINK_MARK} {link}")
 
     footer = (
         "\n\n"
@@ -312,18 +318,41 @@ def chat_identifier(raw):
     return cleaned if ("@g.us" in cleaned or "@c.us" in cleaned) else f"{cleaned}@c.us"
 
 
-def deliver(message):
+def deliver_whatsapp(message):
     failures = []
+    if not PHONE_NUMBERS or not ID_INSTANCE or not API_TOKEN:
+        return ["WhatsApp credentials missing"]
     for raw in (p for p in PHONE_NUMBERS.split(",") if p.strip()):
         chat = chat_identifier(raw)
         try:
             green_post("sendMessage", json={"chatId": chat, "message": message})
-            print(f"Headlines delivered to {chat}")
+            print(f"Headlines delivered via WhatsApp to {chat}")
         except Exception as error:
-            failures.append(f"{chat}: {error}")
-            print(f"FAILED for {chat}: {error}")
+            failures.append(f"WhatsApp {chat}: {error}")
+            print(f"FAILED for WhatsApp {chat}: {error}")
         time.sleep(3)
     return failures
+
+
+def deliver_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Skipping Telegram: Missing token or chat ID.")
+        return ["Telegram credentials missing"]
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": False
+        }
+        response = requests.post(url, json=payload, timeout=20)
+        response.raise_for_status()
+        print("✅ Headlines successfully delivered to Telegram!")
+        return []
+    except Exception as error:
+        print(f"❌ Telegram delivery failed: {error}")
+        return [f"Telegram: {error}"]
 
 
 def main():
@@ -332,21 +361,27 @@ def main():
         ("GREEN_API_TOKEN", API_TOKEN),
         ("PHONE_NUMBER", PHONE_NUMBERS),
     ] if not value]
+    
     if missing:
-        print(f"Missing environment variables: {', '.join(missing)}")
-        sys.exit(1)
+        print(f"Warning: Missing WhatsApp environment variables: {', '.join(missing)}")
 
     try:
         stories = pick_stories(merge_collected(read_feed()))
         message = build_message(stories, tidy_links(stories))
     except Exception as error:
         print(f"NOT SENT: {error}")
-        sys.exit(1)  # the team gets nothing; GitHub emails you instead
+        sys.exit(1)
 
     print("\n===== MESSAGE =====\n" + message + "\n===================")
-    problems = deliver(message)
-    if problems:
-        print("PROBLEMS:", *problems, sep="\n- ")
+    
+    # Dispatch concurrently to both channels
+    wa_problems = deliver_whatsapp(message) if ID_INSTANCE and PHONE_NUMBERS else []
+    tg_problems = deliver_telegram(message) if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID else []
+    
+    all_problems = wa_problems + tg_problems
+    if all_problems and len(all_problems) == (len(PHONE_NUMBERS.split(",")) if PHONE_NUMBERS else 0) + 1:
+        # If everything completely failed
+        print("PROBLEMS:", *all_problems, sep="\n")
         sys.exit(1)
 
 
