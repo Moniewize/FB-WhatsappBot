@@ -3,6 +3,7 @@ import io
 import json
 import os
 import re
+import socket
 import sys
 import tempfile
 import time
@@ -18,6 +19,15 @@ API_TOKEN = os.getenv("GREEN_API_TOKEN")
 PHONE_NUMBERS = os.getenv("PHONE_NUMBER")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# Optional: the host shown as "apiUrl" in your Green API console instance settings
+GREEN_API_URL = (os.getenv("GREEN_API_URL") or "").strip().rstrip("/")
+GREEN_API_HOSTS = [h for h in dict.fromkeys([
+    GREEN_API_URL,                 # your own host, if set
+    "https://api.greenapi.com",    # Green API's universal host
+    "https://api.green-api.com",   # the old host
+]) if h]
+GREEN_STATE = {"down": False}      # set once every host proved unreachable
 
 PUNCH_OFFICIAL_RSS = "https://rss.punchng.com/v1/category/latest_news"
 NIGERIA = ZoneInfo("Africa/Lagos")
@@ -60,6 +70,15 @@ NOISE_WORDS = {
     "should", "still", "only", "some", "other",
 }
 TOKEN = re.compile(r"n\d[\d.,]*(?:bn|trn|m|b|k)?|[a-z]{4,}|\d[\d,]*\d")
+
+
+def safe(text):
+    """Hides secret tokens in anything that is printed."""
+    text = str(text)
+    for secret in (API_TOKEN, TELEGRAM_TOKEN):
+        if secret:
+            text = text.replace(secret, "***")
+    return text
 
 
 def clean(text):
@@ -323,11 +342,45 @@ def build_message(stories, links):
     return "\n\n".join(lines) + footer
 
 
+def check_green_hosts():
+    """Prints whether this machine can reach each Green API host (helps diagnose timeouts)."""
+    for host in GREEN_API_HOSTS:
+        name = host.split("//")[1]
+        try:
+            infos = socket.getaddrinfo(name, 443, proto=socket.IPPROTO_TCP)
+            addresses = sorted({info[4][0] for info in infos})
+            with socket.create_connection((name, 443), timeout=10):
+                pass
+            print(f"Network check {name}: reachable ({', '.join(addresses[:3])}).")
+        except Exception as error:
+            print(f"Network check {name}: FAILED ({type(error).__name__}: {error}).")
+
+
 def green_post(endpoint, **kwargs):
-    link = f"https://api.green-api.com/waInstance{ID_INSTANCE}/{endpoint}/{API_TOKEN}"
-    response = requests.post(link, timeout=60, **kwargs)
-    response.raise_for_status()
-    return response.json()
+    """Sends a request to Green API, trying each host. Moves on only if no connection was made."""
+    if GREEN_STATE["down"]:
+        raise ConnectionError("Green API was unreachable earlier in this run")
+    last_error = None
+    for round_number in range(2):
+        for host in list(GREEN_API_HOSTS):
+            link = f"{host}/waInstance{ID_INSTANCE}/{endpoint}/{API_TOKEN}"
+            try:
+                response = requests.post(link, timeout=(10, 60), **kwargs)
+            except requests.ConnectionError as error:  # no connection: nothing was sent
+                last_error = error
+                print(f"Green API host not reachable: {host.split('//')[1]}")
+                continue
+            response.raise_for_status()
+            print(f"Green API host used: {host.split('//')[1]}")
+            if host != GREEN_API_HOSTS[0]:  # try the host that worked first next time
+                GREEN_API_HOSTS.remove(host)
+                GREEN_API_HOSTS.insert(0, host)
+            return response.json()
+        if round_number == 0:
+            print("No Green API host reachable. Waiting 20 seconds, then trying again.")
+            time.sleep(20)
+    GREEN_STATE["down"] = True
+    raise last_error
 
 
 def chat_identifier(raw):
@@ -348,6 +401,7 @@ def deliver_whatsapp(message):
     if not whatsapp_ready():
         print("WhatsApp skipped: credentials not set.")
         return 0, []
+    check_green_hosts()
     sent, problems = 0, []
     for raw in (p for p in PHONE_NUMBERS.split(",") if p.strip()):
         chat = chat_identifier(raw)
@@ -356,8 +410,8 @@ def deliver_whatsapp(message):
             sent += 1
             print(f"Headlines delivered via WhatsApp to {chat}")
         except Exception as error:
-            problems.append(f"WhatsApp {chat}: {error}")
-            print(f"FAILED for WhatsApp {chat}: {error}")
+            problems.append(f"WhatsApp {chat}: {safe(error)}")
+            print(f"FAILED for WhatsApp {chat}: {safe(error)}")
         time.sleep(3)
     return sent, problems
 
@@ -372,16 +426,19 @@ def deliver_telegram(message):
     for extra in ({"parse_mode": "Markdown"}, {}):  # plain text if Markdown is rejected
         try:
             response = requests.post(link, json={**base, **extra}, timeout=30)
-            if response.status_code == 400 and extra:
-                print(f"Telegram rejected the formatting ({response.text[:120]}). "
-                      "Retrying as plain text.")
-                continue
-            response.raise_for_status()
-            print("Headlines delivered to Telegram.")
-            return 1, []
         except Exception as error:
-            print(f"Telegram delivery failed: {error}")
-            return 0, [f"Telegram: {error}"]
+            print(f"Telegram not reachable: {safe(error)}")
+            return 0, [f"Telegram: {safe(error)}"]
+        if response.status_code == 400 and extra:
+            print(f"Telegram rejected the formatting ({response.text[:150]}). "
+                  "Retrying as plain text.")
+            continue
+        if not response.ok:
+            reason = response.text[:300]
+            print(f"Telegram refused ({response.status_code}): {reason}")
+            return 0, [f"Telegram {response.status_code}: {reason}"]
+        print("Headlines delivered to Telegram.")
+        return 1, []
     return 0, ["Telegram: delivery failed"]
 
 
@@ -394,7 +451,7 @@ def main():
         stories = pick_stories(merge_collected(read_feed()))
         message = build_message(stories, tidy_links(stories))
     except Exception as error:
-        print(f"NOT SENT: {error}")
+        print(f"NOT SENT: {safe(error)}")
         sys.exit(1)  # the team gets nothing; GitHub emails you instead
 
     print("\n===== MESSAGE =====\n" + message + "\n===================")

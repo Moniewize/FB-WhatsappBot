@@ -30,6 +30,7 @@ jobs:
         env:
           GREEN_API_ID_INSTANCE: ${{ secrets.GREEN_API_ID_INSTANCE }}
           GREEN_API_TOKEN: ${{ secrets.GREEN_API_TOKEN }}
+          GREEN_API_URL: ${{ secrets.GREEN_API_URL }}
           PHONE_NUMBER: ${{ secrets.PHONE_NUMBER }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
