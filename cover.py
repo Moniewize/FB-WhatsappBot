@@ -29,6 +29,7 @@ MEDIA_HOSTS = [h for h in dict.fromkeys([
     *API_HOSTS,                    # these accepted uploads for you before
 ]) if h]
 GREEN_STATE = {"down": False}      # set once every host proved unreachable
+UPLOAD_STATE = {"down": False}     # set once the media hosts gave a gateway error and the journal showed nothing sent
 SEND_ATTEMPTS = 2                  # tries per recipient
 JOURNAL_WAIT_SECONDS = 120         # Green API's journal can lag by up to 2 minutes
 
@@ -88,6 +89,7 @@ def to_jpeg(data):
 
 
 def fetch_cover():
+    """Returns (jpeg_bytes, source_address_of_the_cover)."""
     with sync_playwright() as playwright:
         browser = launch_browser(playwright)
         try:
@@ -142,13 +144,14 @@ def fetch_cover():
                 print("Using a screenshot of the cover instead.")
                 data = cover.screenshot(type="png")
 
-            return to_jpeg(data)
+            return to_jpeg(data), source
         finally:
             browser.close()
 
 
 def get_cover():
-    """Downloads today's cover, trying again for a while if it is not online yet."""
+    """Downloads today's cover, trying again for a while if it is not online yet.
+    Returns (jpeg_bytes, source_address) or None."""
     for attempt in range(1, COVER_ATTEMPTS + 1):
         try:
             return fetch_cover()
@@ -225,7 +228,7 @@ def already_sent(chat, caption):
 
 
 def send_cover(chat, image, caption):
-    """Sends the cover to one chat without risking a duplicate after a gateway timeout."""
+    """Step 1: uploads the cover without risking a duplicate after a gateway timeout."""
     data = {"chatId": chat, "fileName": "punch_frontpage.jpg", "caption": caption}
     files = {"file": ("punch_frontpage.jpg", image, "image/jpeg")}
     skip = set()
@@ -246,6 +249,61 @@ def send_cover(chat, image, caption):
             print("Not in the journal. Trying the next host.")
 
 
+def send_cover_by_link(chat, source, caption):
+    """Step 2: asks Green API to fetch the picture from its public address.
+    This uses the normal API host, not the media hosts that were failing."""
+    extension = source.split("?")[0].rsplit(".", 1)[-1].lower()
+    if extension not in ("jpg", "jpeg", "png", "webp"):
+        extension = "jpg"
+    payload = {
+        "chatId": chat,
+        "urlFile": source,
+        "fileName": f"punch_frontpage.{extension}",
+        "caption": caption,
+    }
+    try:
+        green_post("sendFileByUrl", json=payload)
+    except GreenAmbiguous as error:
+        print(f"Green API gave no clear answer to the link send ({error}). Waiting "
+              f"{JOURNAL_WAIT_SECONDS} seconds, then checking whether it was sent anyway.")
+        time.sleep(JOURNAL_WAIT_SECONDS)
+        if already_sent(chat, caption):
+            print("The message journal shows the cover was delivered after all.")
+            return
+        raise
+
+
+def send_cover_as_text(chat, caption):
+    """Step 3: plain text with the page address, so the team still gets something.
+    The page address always shows today's cover, so it is more dependable than the image address."""
+    green_post("sendMessage", json={"chatId": chat, "message": f"{caption}\n{COVER_PAGE_LINK}"})
+
+
+def send_with_fallback(chat, image, source, caption):
+    """Tries upload, then link, then text. Returns the method that worked, or raises if all three fail."""
+    if not UPLOAD_STATE["down"]:
+        try:
+            send_cover(chat, image, caption)
+            return "upload"
+        except GreenAmbiguous as error:
+            # The media hosts are not answering. Skip the long upload waits for the other recipients.
+            UPLOAD_STATE["down"] = True
+            print(f"Upload failed for {chat} ({error}). Skipping uploads for the remaining recipients.")
+        except Exception as error:
+            print(f"Upload failed for {chat}: {safe(error)}")
+    else:
+        print(f"Upload skipped for {chat}: the media hosts failed earlier in this run.")
+
+    try:
+        send_cover_by_link(chat, source, caption)
+        return "link"
+    except Exception as error:
+        print(f"Send by link failed for {chat}: {safe(error)}")
+
+    send_cover_as_text(chat, caption)
+    return "text"
+
+
 def chat_identifier(raw):
     cleaned = raw.strip().replace("+", "").replace(" ", "")
     return cleaned if ("@g.us" in cleaned or "@c.us" in cleaned) else f"{cleaned}@c.us"
@@ -259,8 +317,8 @@ def telegram_ready():
     return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 
-def deliver_whatsapp(image):
-    """Returns (photos_sent, problems)."""
+def deliver_whatsapp(image, source):
+    """Returns (recipients_reached, problems)."""
     if not whatsapp_ready():
         print("WhatsApp skipped: credentials not set.")
         return 0, []
@@ -269,9 +327,11 @@ def deliver_whatsapp(image):
     for raw in (p for p in PHONE_NUMBERS.split(",") if p.strip()):
         chat = chat_identifier(raw)
         try:
-            send_cover(chat, image, caption)
+            method = send_with_fallback(chat, image, source, caption)
             sent += 1
-            print(f"Cover delivered to WhatsApp chat {chat}")
+            print(f"WhatsApp chat {chat}: delivered by {method}")
+            if method != "upload":
+                print(f"NOTE: {chat} did not get the image by upload, so the media hosts may still be having trouble.")
         except Exception as error:
             problems.append(f"WhatsApp {chat}: {safe(error)}")
             print(f"FAILED for WhatsApp {chat}: {safe(error)}")
@@ -316,14 +376,14 @@ def main():
         print("No delivery channel is configured (WhatsApp or Telegram secrets missing).")
         sys.exit(1)
 
-    image = get_cover()
-    if image is None:
+    cover = get_cover()
+    if cover is None:
         print("No cover sent: it never became available.")
         sys.exit(1)
+    image, source = cover
 
     delivered, problems = 0, []
-    for deliver in (deliver_whatsapp, deliver_telegram):
-        sent, issues = deliver(image)
+    for sent, issues in (deliver_whatsapp(image, source), deliver_telegram(image)):
         delivered += sent
         problems += issues
 
