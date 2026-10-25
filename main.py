@@ -160,7 +160,7 @@ def get_cover():
 
     for attempt in range(1, COVER_ATTEMPTS + 1):
         try:
-            return fetch_cover()
+            return fetch_cover()[0]
         except Exception as error:
             print(f"Cover not ready (attempt {attempt} of {COVER_ATTEMPTS}): {error}")
             if attempt < COVER_ATTEMPTS:
