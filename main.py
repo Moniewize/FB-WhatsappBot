@@ -70,6 +70,13 @@ NOISE_WORDS = {
     "should", "still", "only", "some", "other",
 }
 TOKEN = re.compile(r"n\d[\d.,]*(?:bn|trn|m|b|k)?|[a-z]{4,}|\d[\d,]*\d")
+MIN_BLOCK_COVERAGE = 0.60    # share of a cover headline's words that must appear in the story title
+BLOCK_HEIGHT_RATIO = 0.6     # lines of one headline have a similar letter height ...
+BLOCK_GAP = 0.8              # ... and sit closer together than this many letter heights
+REPEAT_LIMIT = 0.5           # a filler story sharing this much of its words with a chosen story is a repeat
+# a bullet sign at the start of a line marks the small lines under a main headline
+BULLET = re.compile(r"^\s*(?:[•·●■▪◦]|o(?=[A-Z0-9\"“‘']))\s*")
+REPEAT_IGNORE = {"federal", "government", "nigeria", "nigerian", "nigerians"}
 
 
 def safe(text):
@@ -169,7 +176,7 @@ def get_cover():
 
 
 def read_cover_lines(image_bytes):
-    """Reads the cover twice (normal and colour-inverted) and returns its text lines."""
+    """Reads the cover twice (normal and colour-inverted) and returns its text lines with positions."""
     from PIL import Image, ImageOps
     from rapidocr import RapidOCR
 
@@ -193,8 +200,11 @@ def read_cover_lines(image_bytes):
             if score < 0.5 or len(key) < 3 or key in seen_text:
                 continue
             seen_text.add(key)
+            xs = [float(p[0]) for p in box]
             ys = [float(p[1]) for p in box]
-            found.append({"h": max(ys) - min(ys), "text": text})
+            found.append({"h": max(ys) - min(ys), "text": text,
+                          "x0": min(xs), "x1": max(xs), "y0": min(ys), "y1": max(ys),
+                          "bullet": bool(BULLET.match(text))})
     if not found:
         return []
 
@@ -207,44 +217,125 @@ def read_cover_lines(image_bytes):
     return keep
 
 
-def match_cover(stories, lines):
-    """Stories whose title words appear on the cover, biggest print first."""
+def find(word, pool):
+    """The word itself, a plural or near spelling of it in the pool, or None."""
     from rapidfuzz import fuzz, process
 
-    cover_words, height_of = set(), {}
-    for line in lines:
-        for word in words_in(line["text"]):
-            cover_words.add(word)
-            height_of[word] = max(height_of.get(word, 0), line["h"])
+    if word in pool:
+        return word
+    for other in pool:
+        if other.rstrip("s") == word.rstrip("s") and len(word) > 3:
+            return other
+    if len(word) >= 5 and not any(ch.isdigit() for ch in word):
+        best = process.extractOne(word, list(pool), scorer=fuzz.ratio, score_cutoff=86)
+        if best:
+            return best[0]
+    return None
 
-    def find(word):
-        if word in cover_words:
-            return word
-        if len(word) >= 6:
-            best = process.extractOne(word, cover_words, scorer=fuzz.ratio, score_cutoff=88)
-            if best:
-                return best[0]
-        return None
 
-    rows = []
+def share(words, pool):
+    """Share of the words' letters whose word appears in the pool."""
+    total = sum(len(w) for w in words)
+    if not total:
+        return 0.0
+    return sum(len(w) for w in words if find(w, pool)) / total
+
+
+def cover_blocks(lines):
+    """Joins neighbouring lines of the same letter size into headlines. Bullet blocks are dropped."""
+    parent = list(range(len(lines)))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, a in enumerate(lines):
+        for j in range(i + 1, len(lines)):
+            b = lines[j]
+            big, small = max(a["h"], b["h"]), min(a["h"], b["h"])
+            if big <= 0 or small < BLOCK_HEIGHT_RATIO * big:
+                continue
+            if min(a["x1"], b["x1"]) - max(a["x0"], b["x0"]) <= 0:
+                continue  # side by side, not stacked
+            gap = max(a["y0"], b["y0"]) - min(a["y1"], b["y1"])
+            if gap <= BLOCK_GAP * big:
+                parent[root(i)] = root(j)
+
+    groups = {}
+    for i, line in enumerate(lines):
+        groups.setdefault(root(i), []).append(line)
+
+    blocks = []
+    for members in groups.values():
+        members.sort(key=lambda m: (m["y0"], m["x0"]))
+        if members[0]["bullet"]:
+            continue  # the small bullet lines under a main headline are not wanted
+        text = " ".join(BULLET.sub("", m["text"]) for m in members)
+        words = list(dict.fromkeys(words_in(text)))
+        if len(words) < MIN_WORDS:
+            continue
+        blocks.append({"text": text, "words": words,
+                       "size": max(m["h"] for m in members),
+                       "top": min(m["y0"] for m in members)})
+    return blocks
+
+
+def match_cover(stories, lines):
+    """One story for each cover headline. The biggest headline comes first, then top to bottom."""
+    blocks = cover_blocks(lines)
+    infos = []
     for story in stories:
         if ROUNDUP.search(story["title"]):
             continue
         words = list(dict.fromkeys(words_in(story["title"])))
-        if len(words) < MIN_WORDS:
+        if len(words) >= MIN_WORDS:
+            infos.append({"story": story, "words": words})
+
+    pairs = []
+    for b, block in enumerate(blocks):
+        for s, info in enumerate(infos):
+            story_share = share(info["words"], block["words"])
+            if story_share < MIN_COVERAGE:
+                continue
+            block_share = share(block["words"], info["words"])
+            if block_share < MIN_BLOCK_COVERAGE:
+                continue
+            pairs.append((story_share + block_share, b, s))
+    pairs.sort(reverse=True)
+
+    used_blocks, used_stories, taken = set(), set(), {}
+    for score, b, s in pairs:  # best pairs first; a headline or a story is used once
+        if b in used_blocks or s in used_stories:
             continue
-        hits = {w: find(w) for w in words}
-        coverage = sum(len(w) for w, h in hits.items() if h) / sum(len(w) for w in words)
-        size = max((height_of[h] for h in hits.values() if h), default=0)
-        rows.append({"story": story, "coverage": coverage, "size": size})
+        used_blocks.add(b)
+        used_stories.add(s)
+        taken[b] = infos[s]["story"]
 
-    print("\nBest cover matches (share of title found | story):")
-    for row in sorted(rows, key=lambda r: -r["coverage"])[:15]:
-        print(f"  {row['coverage']:.2f} | {row['story']['title'][:80]}")
+    print("\nCover headlines and the story found for each:")
+    for b, block in sorted(enumerate(blocks), key=lambda row: row[1]["top"])[:25]:
+        story = taken.get(b)
+        label = story["title"][:70] if story else "NO STORY FOUND"
+        print(f"  {block['text'][:60]!r} -> {label}")
 
-    accepted = [r for r in rows if r["coverage"] >= MIN_COVERAGE]
-    accepted.sort(key=lambda r: -r["size"])
-    return [r["story"] for r in accepted][:MAX_ITEMS]
+    order = []
+    if taken:
+        biggest = max(taken, key=lambda k: blocks[k]["size"])
+        order = [biggest] + sorted((b for b in taken if b != biggest), key=lambda b: blocks[b]["top"])
+    return [taken[b] for b in order][:MAX_ITEMS]
+
+
+def repeats(title, chosen_titles):
+    """True when the title is mostly the same words as an already chosen story."""
+    mine = [w for w in dict.fromkeys(words_in(title)) if w not in REPEAT_IGNORE]
+    if not mine:
+        return False
+    for other_title in chosen_titles:
+        other = [w for w in dict.fromkeys(words_in(other_title)) if w not in REPEAT_IGNORE]
+        if other and (share(mine, other) >= REPEAT_LIMIT or share(other, mine) >= REPEAT_LIMIT):
+            return True
+    return False
 
 
 def pick_stories(feed):
@@ -280,14 +371,18 @@ def pick_stories(feed):
     tier3 = sorted((s for s in usable if s["published"] > now - timedelta(hours=24)),
                    key=lambda s: s["published"], reverse=True)
 
-    chosen, seen = [], set()
+    chosen, seen, repeated = [], set(), 0
     for tier in (matched, tier1, tier2, tier3):
         for story in tier:
-            if story["link"] not in seen and len(chosen) < MAX_ITEMS:
-                seen.add(story["link"])
-                chosen.append(story)
+            if story["link"] in seen or len(chosen) >= MAX_ITEMS:
+                continue
+            if tier is not matched and repeats(story["title"], [c["title"] for c in chosen]):
+                repeated += 1  # a filler story about a topic already in the list
+                continue
+            seen.add(story["link"])
+            chosen.append(story)
     print(f"From the cover: {len(matched)}. Filled from the midnight window and newest: "
-          f"{len(chosen) - len(matched)}.")
+          f"{len(chosen) - len(matched)}. Filler skipped as repeats: {repeated}.")
     return chosen
 
 
